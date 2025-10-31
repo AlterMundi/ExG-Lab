@@ -1,0 +1,37 @@
+# Project-wide gitignore
+
+# Data
+/data/
+*.csv
+*.hdf5
+
+# Environment
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+.next/
+out/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# V0 exports
+*.zip
