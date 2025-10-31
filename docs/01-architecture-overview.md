@@ -212,10 +212,14 @@ def pull_latest(inlet, duration=2.0):
 - 2s = 512 samples → Δf = 0.5 Hz (balanced)
 - 4s = 1024 samples → Δf = 0.25 Hz (stable)
 
-**Performance**:
-- Sequential: 3× FFT = ~10ms per device
-- For 4 devices: 40ms total
-- Target rate: 10-25 Hz (40-100ms budget)
+**Performance** (per device, 4 channels):
+- Single-device: 3 timescales × ~15ms = ~45ms total
+- Target calc rate: 10 Hz (100ms budget) ✓ achievable
+
+**Multi-device scaling**:
+- Sequential (1→2→3→4): 4 × 45ms = **180ms** ❌ exceeds budget!
+- Parallel (ThreadPoolExecutor): max(45ms) = **45ms** ✓ within budget
+- **Conclusion**: Threading is MANDATORY for 2+ devices, not optional
 
 **Key optimization**: Can't reuse FFT between windows (different sizes), but CAN reuse filtered data and same buffer.
 
@@ -298,28 +302,45 @@ while session_active:
 
 ### Latency Budget
 
+**IMPORTANT**: Distinguish between **processing latency** (how long to compute) and **window delay** (how much data averaging):
+
+**Processing Latency** (hardware + software):
 ```
 Brain activity happens (t=0)
-  ↓ ~4ms  (Muse sampling at 256 Hz)
+  ↓ ~4ms    (Muse sampling at 256 Hz)
 Bluetooth transmission
-  ↓ ~20ms (BLE inherent latency)
+  ↓ ~20ms   (BLE inherent latency)
 muselsl receives
-  ↓ ~5ms  (processing + LSL publish)
-LSL buffer
-  ↓ 0-50ms (waiting for next pull)
+  ↓ ~5ms    (processing + LSL publish)
+LSL buffer wait
+  ↓ 0-50ms  (avg 25ms @ 20 Hz pull rate)
 Backend pulls data
-  ↓ ~1ms  (memory copy)
+  ↓ ~1ms    (memory copy)
 Rolling buffer update
-  ↓ ~0.1ms
+  ↓ ~1ms    (thread-safe append)
+Wait for calc cycle
+  ↓ 0-100ms (avg 50ms @ 10 Hz calc rate)
 FFT computation
-  ↓ ~10ms  (scipy)
+  ↓ ~45ms   (parallel, 4 devices)
 WebSocket send
-  ↓ ~2ms   (localhost)
-Browser receives
-  ↓ ~16ms  (60 Hz display)
+  ↓ ~2ms    (localhost)
+Browser render
+  ↓ ~16ms   (60 Hz display)
 
-Total: ~60-110ms typical
+Total Processing Latency: ~70-270ms (avg ~170ms)
 ```
+
+**Window Delay** (data averaging period):
+- 1s window: shows state averaged over last 1000ms (center: 500ms ago)
+- 2s window: shows state averaged over last 2000ms (center: 1000ms ago)
+- 4s window: shows state averaged over last 4000ms (center: 2000ms ago)
+
+**Total Perceptual Delay** (processing + window center):
+- 1s metric: ~170ms + 500ms = **~670ms** behind brain activity
+- 2s metric: ~170ms + 1000ms = **~1170ms** behind brain activity
+- 4s metric: ~170ms + 2000ms = **~2170ms** behind brain activity
+
+**Note**: This is expected and intentional - longer windows provide stability at cost of responsiveness.
 
 ### Throughput
 
@@ -333,8 +354,8 @@ Total: ~60-110ms typical
 - UI: 10-30 Hz = 33-100ms interval
 
 **Resource usage** (4 devices):
-- CPU: 10-40% (depending on calc_rate)
-- RAM: ~50 MB total
+- CPU: 10-60% (depending on calc_rate; parallel processing required for 4 devices)
+- RAM: ~100-200 MB total (including LSL buffers and processing overhead)
 - Network: ~5 KB/s (processed metrics only, not raw data)
 
 ## Design Decisions Rationale
@@ -381,19 +402,27 @@ Total: ~60-110ms typical
 
 **Critical insight**: These serve different purposes!
 
-- **Pull rate**: Prevents LSL buffer accumulation (freshness)
-- **Calc rate**: Limited by CPU (performance)
-- **UI rate**: Limited by human perception (UX)
+- **Pull rate**: Prevents LSL buffer accumulation (freshness) - must be ≥20 Hz
+- **Calc rate**: Limited by CPU (performance) - 10 Hz with parallel threading
+- **UI rate**: Limited by human perception (UX) - 10 Hz is smooth
 
 Coupling them wastes either CPU (too fast calc) or freshness (too slow pull).
+
+**Threading Model Requirements**:
+1. **Pure threading** (not async/await) - pylsl's `pull_chunk()` is blocking C extension
+2. **ThreadPoolExecutor** for parallel FFT computation (4 workers minimum)
+3. **threading.Lock** on all shared buffers to prevent race conditions
+4. **Queue-based** communication between pull threads and calc thread
+5. **Sync→Async bridge** for WebSocket sends (asyncio.create_task)
 
 ## Failure Modes & Recovery
 
 ### Device disconnection
 
-**Detection**: LSL stream stops providing data
-**Recovery**: Auto-reconnect with exponential backoff
+**Detection**: LSL stream stops providing data or health monitoring fails
+**Recovery**: Auto-reconnect with exponential backoff (implemented in DeviceManager.monitor_device_health)
 **Recording**: Mark gap in data, continue other devices
+**Implementation**: Reconnection logic is mandatory for production use
 
 ### Buffer overflow
 
@@ -412,6 +441,100 @@ Coupling them wastes either CPU (too fast calc) or freshness (too slow pull).
 **Detection**: Socket error event
 **Recovery**: Auto-reconnect, re-send last metrics
 **Recording**: Continues unaffected (independent)
+
+## Design Requirements for Production
+
+### Threading Architecture (CRITICAL)
+
+**Why Pure Threading (Not Async/Await)**:
+
+pylsl's `pull_chunk()` is a **blocking C extension** that cannot yield to Python's event loop. This makes async/await fundamentally incompatible with LSL operations:
+
+```python
+# ❌ WRONG - This will freeze the event loop
+async def pull_loop(self):
+    while self.active:
+        chunk, ts = self.inlet.pull_chunk(timeout=0.0)  # Blocks event loop!
+        await asyncio.sleep(0.05)
+
+# ✅ CORRECT - Dedicated thread for blocking operations
+def pull_thread(self):
+    while self.active:
+        chunk, ts = self.inlet.pull_chunk(timeout=0.0)
+        with self.buffer_lock:  # Thread-safe
+            self.buffer.extend(chunk)
+        time.sleep(0.05)
+```
+
+**Required Threading Model**:
+
+1. **Pull Threads** (4 threads, one per device):
+   - Dedicated thread per LSL inlet
+   - Runs blocking `pull_chunk()` at 20 Hz
+   - Updates shared buffers with lock protection
+   - Handles pull errors gracefully
+
+2. **Calc Thread** (1 thread with ThreadPoolExecutor):
+   - Reads from shared buffers (with locks)
+   - Submits 4 FFT jobs to ThreadPoolExecutor
+   - Waits for all results (parallel processing)
+   - Updates metrics cache (with lock)
+
+3. **Save Thread** (1 thread):
+   - Periodically flushes recording buffers to disk
+   - Independent of feedback processing
+
+4. **WebSocket Bridge** (async task creation):
+   - Calc thread triggers: `asyncio.create_task(send_metrics())`
+   - Avoids blocking calc thread on WebSocket I/O
+
+**Thread Synchronization**:
+```python
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+class ThreadSafeBuffer:
+    def __init__(self, maxlen=1024):
+        self.buffer = deque(maxlen=maxlen)
+        self.lock = threading.Lock()
+
+    def extend(self, data):
+        with self.lock:
+            self.buffer.extend(data)
+
+    def get_snapshot(self):
+        with self.lock:
+            return np.array(self.buffer)
+
+# Global resources
+buffer_locks = {f'Muse_{i}': threading.Lock() for i in range(1, 5)}
+metrics_lock = threading.Lock()
+executor = ThreadPoolExecutor(max_workers=4)
+```
+
+**Lock Acquisition Order** (prevent deadlock):
+1. Pull threads: acquire only their device's buffer lock
+2. Calc thread: acquire buffers in order (Muse_1 → Muse_4), then metrics lock
+3. Save thread: acquire recording buffers in order
+4. Never hold multiple locks simultaneously unless necessary
+
+### Training Protocols and Onboarding
+
+While training protocols are experiment-specific, the framework must support:
+- Configurable training phases with different timescales
+- Progress tracking and adaptive difficulty
+- User onboarding flows for multi-timescale interpretation
+- Data export for protocol analysis
+
+### Edge Cases and Error Handling
+
+**Must handle**:
+- Device disconnection during sessions (reconnection logic)
+- Data corruption and artifact detection
+- Buffer underflow/overflow conditions
+- Network interruptions (WebSocket reconnect)
+- CPU overload (adaptive rate reduction)
+- Memory pressure (buffer size management)
 
 ## Next Steps
 

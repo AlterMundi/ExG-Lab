@@ -462,7 +462,8 @@ def compute_frontal_relaxation(self):
 # → Max rate: 16 Hz (1000ms / 60ms)
 ```
 
-**For 4 devices**: 4 × 60ms = 240ms → Max rate: 4 Hz
+**For 4 devices**: 4 × 60ms = 240ms → Max rate: 4 Hz (sequential - too slow!)
+**With parallelization**: 60ms total → Max rate: 16 Hz (required for multi-device support)
 
 ### Parallel Processing
 

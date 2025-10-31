@@ -173,6 +173,56 @@ class DeviceManager:
             print("Device scan timed out")
             return []
 
+    def monitor_device_health(self):
+        """
+        Monitor device streams and reconnect if needed
+
+        This implements automatic reconnection logic for dropped Bluetooth connections.
+        Should be called periodically (e.g., every 5-10 seconds).
+        """
+        for stream_name, device_info in self.devices.items():
+            if not self._is_stream_alive(stream_name):
+                print(f"Device {stream_name} disconnected, attempting reconnection...")
+                self._reconnect_device(stream_name, device_info['address'])
+
+    def _is_stream_alive(self, stream_name: str) -> bool:
+        """
+        Check if a device stream is still active
+
+        Returns:
+            True if stream is responding, False if disconnected
+        """
+        try:
+            # Try to resolve the stream
+            streams = resolve_stream('name', stream_name, timeout=1.0)
+            return len(streams) > 0
+        except:
+            return False
+
+    def _reconnect_device(self, stream_name: str, address: str):
+        """
+        Attempt to reconnect a disconnected device
+
+        Args:
+            stream_name: Name of the stream to reconnect
+            address: Bluetooth MAC address
+        """
+        # Clean up old process if it exists
+        if stream_name in self.processes:
+            try:
+                self.processes[stream_name].terminate()
+                self.processes[stream_name].wait(timeout=2.0)
+            except:
+                pass
+            del self.processes[stream_name]
+
+        # Attempt reconnection
+        success = self.connect_device(address, stream_name)
+        if success:
+            print(f"Successfully reconnected {stream_name}")
+        else:
+            print(f"Failed to reconnect {stream_name}")
+
     def connect_device(self,
                        address: str,
                        stream_name: str,
@@ -269,7 +319,9 @@ class DeviceManager:
 from pylsl import StreamInlet, resolve_stream
 from collections import deque
 import numpy as np
-from typing import Optional, Tuple
+import threading
+from typing import Optional, Tuple, List, Dict
+import time
 
 def flush_inlet_buffer(inlet: StreamInlet) -> int:
     """
@@ -296,7 +348,7 @@ def flush_inlet_buffer(inlet: StreamInlet) -> int:
 class LSLStreamHandler:
     def __init__(self, stream_name: str, buffer_size: int = 1024):
         """
-        Handle LSL stream connection and buffering
+        Thread-safe LSL stream connection and buffering
 
         Args:
             stream_name: Name of LSL stream
@@ -319,14 +371,22 @@ class LSLStreamHandler:
         self.sample_rate = info.nominal_srate()
         self.n_channels = info.channel_count()
 
-        # Rolling buffer (per channel)
+        # Rolling buffer (per channel) - thread-safe access required
         self.buffers = [
             deque(maxlen=buffer_size)
             for _ in range(self.n_channels)
         ]
 
-        # Recording buffer (for saving to disk)
+        # Recording buffer (for saving to disk) - thread-safe access required
         self.recording_buffer = []
+
+        # Thread safety locks
+        self.buffer_lock = threading.Lock()
+        self.recording_lock = threading.Lock()
+
+        # Gap detection
+        self.last_timestamp = None
+        self.gaps = []
 
         # Flush accumulated data
         flushed = flush_inlet_buffer(self.inlet)
@@ -341,7 +401,7 @@ class LSLStreamHandler:
         """
         chunk, timestamps = self.inlet.pull_chunk(
             timeout=0.0,
-            max_samples=256
+            max_samples=256  # Conservative limit for real-time feedback
         )
 
         if not timestamps:
@@ -349,38 +409,54 @@ class LSLStreamHandler:
 
         # Convert to numpy array
         chunk = np.array(chunk)  # Shape: (n_samples, n_channels)
+        timestamps_arr = np.array(timestamps)
 
-        return chunk, np.array(timestamps)
+        # Detect gaps (>100ms since last sample)
+        if self.last_timestamp is not None:
+            gap = timestamps_arr[0] - self.last_timestamp
+            if gap > 0.1:  # 100ms threshold
+                self.gaps.append({
+                    'start': self.last_timestamp,
+                    'end': timestamps_arr[0],
+                    'duration': gap
+                })
+                print(f"Gap detected in {self.stream_name}: {gap*1000:.1f}ms")
+
+        self.last_timestamp = timestamps_arr[-1]
+
+        return chunk, timestamps_arr
 
     def add_to_buffers(self, chunk: np.ndarray):
         """
-        Add chunk to rolling buffers
+        Thread-safe: Add chunk to rolling buffers
 
         Args:
             chunk: Array of shape (n_samples, n_channels)
         """
-        for sample in chunk:
-            for ch_idx, value in enumerate(sample):
-                self.buffers[ch_idx].append(value)
+        with self.buffer_lock:
+            for sample in chunk:
+                for ch_idx, value in enumerate(sample):
+                    self.buffers[ch_idx].append(value)
 
     def add_to_recording(self, chunk: np.ndarray, timestamps: np.ndarray):
         """
-        Add chunk to recording buffer
+        Thread-safe: Add chunk to recording buffer
 
         Args:
             chunk: Array of shape (n_samples, n_channels)
             timestamps: Array of timestamps
         """
-        for i, timestamp in enumerate(timestamps):
-            sample_data = {
-                'timestamp': timestamp,
-                'sample': chunk[i, :].tolist()
-            }
-            self.recording_buffer.append(sample_data)
+        with self.recording_lock:
+            for i, timestamp in enumerate(timestamps):
+                sample_data = {
+                    'timestamp': timestamp,
+                    'sample': chunk[i, :].tolist()
+                }
+                self.recording_buffer.append(sample_data)
 
     def get_buffer_array(self, channel: int) -> np.ndarray:
         """
-        Get rolling buffer as numpy array
+        Thread-safe: Get rolling buffer as numpy array
 
         Args:
             channel: Channel index
@@ -388,11 +464,39 @@ class LSLStreamHandler:
         Returns:
             Array of buffer contents
         """
-        return np.array(self.buffers[channel])
+        with self.buffer_lock:
+            return np.array(self.buffers[channel])
 
-    def clear_recording_buffer(self):
-        """Clear recording buffer after saving"""
-        self.recording_buffer.clear()
+    def get_buffer_snapshot(self) -> List[np.ndarray]:
+        """
+        Thread-safe: Get snapshot of all channel buffers
+
+        Returns:
+            List of arrays, one per channel
+        """
+        with self.buffer_lock:
+            return [np.array(buf) for buf in self.buffers]
+
+    def flush_recording_buffer(self) -> List[Dict]:
+        """
+        Thread-safe: Get and clear recording buffer
+
+        Returns:
+            List of recorded samples
+        """
+        with self.recording_lock:
+            data = self.recording_buffer.copy()
+            self.recording_buffer.clear()
+            return data
+
+    def get_gaps(self) -> List[Dict]:
+        """
+        Get detected gaps in data stream
+
+        Returns:
+            List of gap dictionaries with start, end, duration
+        """
+        return self.gaps.copy()
 ```
 
 ### Step 4: Multi-Scale Processing
@@ -581,35 +685,50 @@ class MultiChannelMultiScaleProcessor:
 ```python
 import time
 import threading
-from typing import Dict, Callable, Optional
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Callable, Optional, List
 from collections import deque
+import logging
+
+logger = logging.getLogger(__name__)
 
 class RateControlledFeedbackLoop:
+    """
+    Thread-based rate decoupling for LSL data acquisition
+
+    Uses pure threading (not async/await) because pylsl operations are blocking.
+    Provides thread-safe buffer access and WebSocket bridging.
+    """
+
     def __init__(self,
                  pull_hz: int = 20,
                  calc_hz: int = 10,
-                 ui_hz: int = 10):
+                 ui_hz: int = 10,
+                 event_loop: Optional[asyncio.AbstractEventLoop] = None):
 
         self.pull_interval = 1.0 / pull_hz
         self.calc_interval = 1.0 / calc_hz
         self.ui_interval = 1.0 / ui_hz
 
-        # Timing state
-        self.last_pull = 0.0
-        self.last_calc = 0.0
-        self.last_ui = 0.0
+        # Event loop for WebSocket bridging
+        self.event_loop = event_loop
 
-        # Metrics cache
+        # Metrics cache (thread-safe)
         self.latest_metrics = None
         self.metrics_lock = threading.Lock()
 
         # Control
         self.active = False
+        self.threads: List[threading.Thread] = []
 
         # Callbacks
         self.pull_callback: Optional[Callable] = None
         self.calc_callback: Optional[Callable] = None
         self.ui_callback: Optional[Callable] = None
+
+        # Threading support for parallel FFT processing
+        self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="FFT")
 
     def set_pull_callback(self, callback: Callable):
         """
@@ -635,60 +754,113 @@ class RateControlledFeedbackLoop:
         """
         self.ui_callback = callback
 
-    def run(self):
-        """
-        Main loop with decoupled rates
-        """
-        self.active = True
-
-        self.last_pull = time.time()
-        self.last_calc = time.time()
-        self.last_ui = time.time()
+    def _pull_thread_func(self):
+        """Pull thread - calls pull_callback at pull_hz rate"""
+        logger.info(f"Pull thread started (target: {1/self.pull_interval:.0f} Hz)")
 
         while self.active:
-            now = time.time()
+            start = time.time()
 
-            # Pull if interval elapsed
-            if (now - self.last_pull >= self.pull_interval
-                and self.pull_callback):
-                self.pull_callback()
-                self.last_pull = now
+            try:
+                if self.pull_callback:
+                    self.pull_callback()
 
-            # Calculate if interval elapsed
-            if (now - self.last_calc >= self.calc_interval
-                and self.calc_callback):
-                metrics = self.calc_callback()
+            except Exception as e:
+                logger.error(f"Pull error: {e}", exc_info=True)
+                time.sleep(1.0)  # Backoff on error
+                continue
 
-                if metrics:
-                    with self.metrics_lock:
-                        self.latest_metrics = metrics
+            # Sleep to maintain rate
+            elapsed = time.time() - start
+            sleep_time = max(0, self.pull_interval - elapsed)
+            time.sleep(sleep_time)
 
-                self.last_calc = now
+    def _calc_thread_func(self):
+        """Calc thread - calls calc_callback at calc_hz rate"""
+        logger.info(f"Calc thread started (target: {1/self.calc_interval:.0f} Hz)")
 
-            # UI update if interval elapsed and metrics available
-            if (now - self.last_ui >= self.ui_interval
-                and self.ui_callback):
+        while self.active:
+            start = time.time()
 
+            try:
+                if self.calc_callback:
+                    metrics = self.calc_callback()
+
+                    if metrics:
+                        with self.metrics_lock:
+                            self.latest_metrics = metrics
+
+            except Exception as e:
+                logger.error(f"Calc error: {e}", exc_info=True)
+
+            # Sleep to maintain rate
+            elapsed = time.time() - start
+            sleep_time = max(0, self.calc_interval - elapsed)
+            time.sleep(sleep_time)
+
+    def _ui_thread_func(self):
+        """UI thread - calls ui_callback at ui_hz rate"""
+        logger.info(f"UI thread started (target: {1/self.ui_interval:.0f} Hz)")
+
+        while self.active:
+            start = time.time()
+
+            try:
+                # Get metrics (thread-safe)
                 with self.metrics_lock:
                     metrics = self.latest_metrics
 
-                if metrics:
-                    self.ui_callback(metrics)
+                # Send if available
+                if metrics and self.ui_callback:
+                    # Bridge to async if event loop provided
+                    if self.event_loop:
+                        asyncio.run_coroutine_threadsafe(
+                            self.ui_callback(metrics),
+                            self.event_loop
+                        )
+                    else:
+                        # Sync callback
+                        self.ui_callback(metrics)
 
-                self.last_ui = now
+            except Exception as e:
+                logger.error(f"UI error: {e}", exc_info=True)
 
-            # Small sleep to prevent busy-wait
-            time.sleep(0.01)
+            # Sleep to maintain rate
+            elapsed = time.time() - start
+            sleep_time = max(0, self.ui_interval - elapsed)
+            time.sleep(sleep_time)
 
-    def start_async(self):
-        """Start loop in background thread"""
-        thread = threading.Thread(target=self.run, daemon=True)
-        thread.start()
-        return thread
+    def start(self):
+        """Start all threads"""
+        self.active = True
+
+        # Create threads
+        self.threads = [
+            threading.Thread(target=self._pull_thread_func, daemon=True, name="pull"),
+            threading.Thread(target=self._calc_thread_func, daemon=True, name="calc"),
+            threading.Thread(target=self._ui_thread_func, daemon=True, name="ui")
+        ]
+
+        # Start all threads
+        for thread in self.threads:
+            thread.start()
+
+        logger.info("All threads started")
 
     def stop(self):
-        """Stop the loop"""
+        """Stop all threads gracefully"""
+        logger.info("Stopping threads...")
         self.active = False
+
+        # Wait for threads to finish
+        for thread in self.threads:
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                logger.warning(f"Thread {thread.name} did not stop cleanly")
+
+        # Shutdown executor
+        self.executor.shutdown(wait=True)
+        logger.info("All threads stopped")
 ```
 
 ### Step 6: Session Management

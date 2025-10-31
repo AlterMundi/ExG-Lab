@@ -153,7 +153,7 @@ Recording to data/session1/test.csv...
 
 ## Using the Patched Version
 
-### Option 1: Install from Fork (Recommended)
+### Option 1: Use Our Fork (RECOMMENDED)
 
 Until the PR is merged, you can install the patched version:
 
@@ -171,9 +171,9 @@ muselsl list
 muselsl record --filename test.csv
 ```
 
-### Option 2: Manual Patching
+### Option 2: Manual Patching (NOT RECOMMENDED)
 
-If you already have muselsl installed, manually apply the fixes:
+If you must use the original muselsl, manually apply the fixes:
 
 ```bash
 # Find muselsl installation
@@ -183,15 +183,17 @@ python -c "import muselsl; print(muselsl.__file__)"
 # Apply the changes shown above
 ```
 
-### Option 3: Wait for Upstream Merge
+### Option 3: Wait for Upstream Merge (NOT RECOMMENDED)
 
 Monitor PR #224 for merge status:
 https://github.com/alexandrebarachant/muse-lsl/pull/224
 
-Once merged and released:
+Once merged and released (if ever):
 ```bash
 pip install --upgrade muselsl
 ```
+
+**Recommendation**: Use our fork instead of waiting for upstream.
 
 ## Verification
 

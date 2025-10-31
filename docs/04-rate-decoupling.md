@@ -185,52 +185,110 @@ class RateControlledLoop:
         self.websocket.send_json(metrics)
 ```
 
-### Pattern 2: Async Event Loop
+### Pattern 2: Separate Threads (RECOMMENDED)
 
 ```python
-import asyncio
+import threading
+import time
+from queue import Queue
 
-class AsyncRateControlledLoop:
+class ThreadedRateControlledLoop:
     def __init__(self):
         self.buffer = deque(maxlen=1024)
+        self.buffer_lock = threading.Lock()
+
         self.latest_metrics = None
+        self.metrics_lock = threading.Lock()
 
-    async def pull_loop(self):
-        """Pull at 20 Hz independently"""
+        self.active = False
+        self.threads = []
+
+    def pull_loop(self):
+        """Pull at 20 Hz in dedicated thread"""
         while self.active:
-            chunk, timestamps = self.inlet.pull_chunk(
-                timeout=0.0,
-                max_samples=256
-            )
-            if timestamps:
-                self.buffer.extend(chunk)
+            try:
+                chunk, timestamps = self.inlet.pull_chunk(
+                    timeout=0.0,
+                    max_samples=256
+                )
 
-            await asyncio.sleep(0.05)  # 20 Hz
+                if timestamps:
+                    with self.buffer_lock:  # Thread-safe
+                        self.buffer.extend(chunk)
 
-    async def calc_loop(self):
-        """Calculate at 10 Hz independently"""
+            except Exception as e:
+                print(f"Pull error: {e}")
+                time.sleep(1.0)  # Backoff on error
+
+            time.sleep(0.05)  # 20 Hz
+
+    def calc_loop(self):
+        """Calculate at 10 Hz in dedicated thread"""
         while self.active:
-            if len(self.buffer) >= 1024:
-                self.latest_metrics = self.processor.compute_all_timescales()
+            try:
+                buffer_snapshot = None
 
-            await asyncio.sleep(0.1)  # 10 Hz
+                with self.buffer_lock:  # Thread-safe read
+                    if len(self.buffer) >= 1024:
+                        buffer_snapshot = np.array(self.buffer)
 
-    async def ui_loop(self):
-        """Send to UI at 10 Hz independently"""
+                if buffer_snapshot is not None:
+                    metrics = self.processor.compute_all_timescales(buffer_snapshot)
+
+                    with self.metrics_lock:  # Thread-safe write
+                        self.latest_metrics = metrics
+
+            except Exception as e:
+                print(f"Calc error: {e}")
+
+            time.sleep(0.1)  # 10 Hz
+
+    def ui_loop(self):
+        """Send to UI at 10 Hz in dedicated thread"""
         while self.active:
-            if self.latest_metrics is not None:
-                await self.websocket.send_json(self.latest_metrics)
+            metrics_copy = None
 
-            await asyncio.sleep(0.1)  # 10 Hz
+            with self.metrics_lock:  # Thread-safe read
+                if self.latest_metrics is not None:
+                    metrics_copy = self.latest_metrics.copy()
 
-    async def run(self):
-        """Run all three loops concurrently"""
-        await asyncio.gather(
-            self.pull_loop(),
-            self.calc_loop(),
-            self.ui_loop()
-        )
+            if metrics_copy:
+                # Bridge to async WebSocket
+                asyncio.run_coroutine_threadsafe(
+                    self.websocket.send_json(metrics_copy),
+                    self.event_loop
+                )
+
+            time.sleep(0.1)  # 10 Hz
+
+    def start(self):
+        """Start all threads"""
+        self.active = True
+
+        # Create threads
+        self.threads = [
+            threading.Thread(target=self.pull_loop, daemon=True, name="pull"),
+            threading.Thread(target=self.calc_loop, daemon=True, name="calc"),
+            threading.Thread(target=self.ui_loop, daemon=True, name="ui")
+        ]
+
+        # Start all
+        for t in self.threads:
+            t.start()
+
+    def stop(self):
+        """Stop all threads gracefully"""
+        self.active = False
+        for t in self.threads:
+            t.join(timeout=2.0)
 ```
+
+**Why This Works**:
+- ✅ Each thread runs independently at its own rate
+- ✅ Locks prevent race conditions on shared state
+- ✅ Error handling prevents one thread from crashing others
+- ✅ Clean shutdown with join timeout
+- ✅ Compatible with FastAPI's async WebSocket (via run_coroutine_threadsafe)
 
 ### Pattern 3: Multi-Device with Threading
 
