@@ -10,12 +10,14 @@ import { SessionProgress } from "@/components/session-progress"
 import { SessionsManager } from "@/components/sessions-manager"
 import { SessionReplay } from "@/components/session-replay"
 import { RawDataViewer } from "@/components/raw-data-viewer"
-import { useMockData } from "@/hooks/use-mock-data"
+import { useRealtimeData } from "@/hooks/use-realtime-data"
 import { useSessionRecorder } from "@/hooks/use-session-recorder"
 import { useRawEEGData } from "@/hooks/use-raw-eeg-data"
 import { Button } from "@/components/ui/button"
 import { History, Activity } from "lucide-react"
 import type { Device, Protocol, SessionState, SavedSession } from "@/types"
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
 
 export default function ExGLabPage() {
   const [devices, setDevices] = useState<Device[]>([])
@@ -26,7 +28,7 @@ export default function ExGLabPage() {
   const [replaySession, setReplaySession] = useState<SavedSession | null>(null)
   const [currentView, setCurrentView] = useState<"feedback" | "raw">("feedback")
 
-  const { metrics, isConnected } = useMockData()
+  const { metrics, isConnected, error } = useRealtimeData()
   const rawData = useRawEEGData()
 
   const { saveSession } = useSessionRecorder(
@@ -38,52 +40,89 @@ export default function ExGLabPage() {
     metrics,
   )
 
-  const handleScan = () => {
+  const handleScan = async () => {
     setIsScanning(true)
-    setTimeout(() => {
-      setDevices([
-        {
-          name: "Muse S - 3C4F",
-          mac: "00:55:DA:B3:3C:4F",
-          status: "available",
-          battery: 87,
-          streamName: null,
-        },
-        {
-          name: "Muse S - 7A21",
-          mac: "00:55:DA:B3:7A:21",
-          status: "available",
-          battery: 72,
-          streamName: null,
-        },
-        {
-          name: "Muse S - 9B15",
-          mac: "00:55:DA:B3:9B:15",
-          status: "available",
-          battery: 94,
-          streamName: null,
-        },
-      ])
+    try {
+      const response = await fetch(`${API_URL}/api/devices/scan`)
+      const data = await response.json()
+
+      if (data.success && data.devices) {
+        setDevices(
+          data.devices.map((d: any) => ({
+            name: d.name,
+            mac: d.address,
+            status: d.status,
+            battery: d.battery || null,
+            streamName: null,
+          }))
+        )
+      } else {
+        console.error("Device scan failed:", data.error || "Unknown error")
+      }
+    } catch (error) {
+      console.error("Failed to scan devices:", error)
+    } finally {
       setIsScanning(false)
-    }, 1500)
+    }
   }
 
-  const handleConnect = (mac: string) => {
-    setDevices((prev) =>
-      prev.map((d) =>
-        d.mac === mac
-          ? {
-              ...d,
-              status: "connected",
-              streamName: `Muse_${devices.filter((dev) => dev.status === "connected").length + 1}`,
-            }
-          : d,
-      ),
-    )
+  const handleConnect = async (mac: string) => {
+    const connectedCount = devices.filter((dev) => dev.status === "connected").length
+    const streamName = `Muse_${connectedCount + 1}`
+
+    try {
+      const response = await fetch(`${API_URL}/api/devices/connect`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address: mac, stream_name: streamName }),
+      })
+      const data = await response.json()
+
+      if (data.success) {
+        setDevices((prev) =>
+          prev.map((d) =>
+            d.mac === mac
+              ? {
+                  ...d,
+                  status: "connected",
+                  streamName: streamName,
+                }
+              : d
+          )
+        )
+      } else {
+        console.error("Device connection failed:", data.error || "Unknown error")
+      }
+    } catch (error) {
+      console.error("Failed to connect device:", error)
+    }
   }
 
-  const handleDisconnect = (mac: string) => {
-    setDevices((prev) => prev.map((d) => (d.mac === mac ? { ...d, status: "available", streamName: null } : d)))
+  const handleDisconnect = async (mac: string) => {
+    const device = devices.find((d) => d.mac === mac)
+    if (!device?.streamName) {
+      console.error("Cannot disconnect: device has no stream name")
+      return
+    }
+
+    try {
+      const response = await fetch(`${API_URL}/api/devices/disconnect`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ stream_name: device.streamName }),
+      })
+      const data = await response.json()
+
+      if (data.success) {
+        setDevices((prev) =>
+          prev.map((d) => (d.mac === mac ? { ...d, status: "available", streamName: null } : d))
+        )
+      } else {
+        console.error("Device disconnection failed:", data.error || "Unknown error")
+      }
+    } catch (error) {
+      console.error("Failed to disconnect device:", error)
+    }
   }
 
   const handleStartSession = (config: any) => {
