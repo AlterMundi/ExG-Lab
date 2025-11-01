@@ -1,6 +1,14 @@
 """
 ExG-Lab Backend - Multi-Device EEG Neurofeedback Platform
-FastAPI application with WebSocket support for real-time metrics
+FastAPI application with LSL integration for real-time neurofeedback
+
+Architecture:
+- Device Management: muselsl subprocess orchestration
+- LSL Streaming: Thread-based pull threads @ 20 Hz
+- Signal Processing: Multi-timescale FFT @ 10 Hz (parallel)
+- Session Management: Protocol-based experimental sessions
+- Data Recording: CSV export with metadata
+- WebSocket Broadcast: Real-time feedback @ 10 Hz
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -13,6 +21,11 @@ import logging
 import time
 from typing import Dict, List, Optional
 
+# Import ExG-Lab modules
+from src.devices import DeviceManager, LSLStreamHandler
+from src.processing import MultiScaleProcessor, RateController, ui_broadcast_loop
+from src.session import SessionManager, SessionPhase, DataRecorder
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -21,7 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# Global State (will be moved to proper managers)
+# Global State
 # ==========================================
 
 class ConnectionManager:
@@ -35,7 +48,8 @@ class ConnectionManager:
         logger.info(f"WebSocket client connected. Total clients: {len(self.active_connections)}")
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
         logger.info(f"WebSocket client disconnected. Total clients: {len(self.active_connections)}")
 
     async def broadcast(self, message: str):
@@ -50,12 +64,23 @@ class ConnectionManager:
 
         # Remove dead connections
         for conn in dead_connections:
-            self.active_connections.remove(conn)
+            if conn in self.active_connections:
+                self.active_connections.remove(conn)
 
 
-# Global instances
+# Global instances (initialized in lifespan)
 ws_manager = ConnectionManager()
-mock_data_task = None
+device_manager: Optional[DeviceManager] = None
+processor: Optional[MultiScaleProcessor] = None
+rate_controller: Optional[RateController] = None
+session_manager: Optional[SessionManager] = None
+data_recorder: Optional[DataRecorder] = None
+
+# Stream handlers (device_name -> LSLStreamHandler)
+stream_handlers: Dict[str, LSLStreamHandler] = {}
+
+# Background tasks
+ui_broadcast_task = None
 
 
 # ==========================================
@@ -76,11 +101,19 @@ class ConnectRequest(BaseModel):
     stream_name: str
 
 
-class SessionConfig(BaseModel):
-    """Session configuration"""
-    devices: List[str]
-    participants: List[str]
-    protocol: str
+class SessionConfigRequest(BaseModel):
+    """Session configuration request"""
+    protocol_name: str
+    subject_ids: Dict[str, str]  # device_name -> subject_id
+    notes: str = ""
+    experimenter: str = ""
+
+
+class MarkerRequest(BaseModel):
+    """Event marker request"""
+    label: str
+    timestamp: Optional[float] = None
+    metadata: Optional[Dict] = None
 
 
 # ==========================================
@@ -90,18 +123,52 @@ class SessionConfig(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
+    global device_manager, processor, rate_controller, session_manager, data_recorder
+    global ui_broadcast_task
+
     logger.info("🚀 ExG-Lab Backend starting...")
 
-    # Start mock data broadcaster
-    global mock_data_task
-    mock_data_task = asyncio.create_task(mock_data_broadcaster())
+    # Initialize managers
+    device_manager = DeviceManager()
+    processor = MultiScaleProcessor(sample_rate=256.0, max_workers=4)
+    data_recorder = DataRecorder(base_dir='./data/sessions')
+    session_manager = SessionManager(devices=[], data_recorder=data_recorder)
+
+    logger.info("✓ Managers initialized")
+
+    # Note: RateController starts when devices connect
+    # Note: UI broadcast loop starts when first device connects
 
     yield
 
     # Cleanup
     logger.info("🛑 ExG-Lab Backend shutting down...")
-    if mock_data_task:
-        mock_data_task.cancel()
+
+    # Cancel UI broadcast
+    if ui_broadcast_task:
+        ui_broadcast_task.cancel()
+        try:
+            await ui_broadcast_task
+        except asyncio.CancelledError:
+            pass
+
+    # Stop rate controller
+    if rate_controller and rate_controller.running:
+        rate_controller.stop()
+
+    # Stop all streams
+    for handler in stream_handlers.values():
+        handler.stop()
+
+    # Stop session if active
+    if session_manager and session_manager.current_session:
+        session_manager.stop_session()
+
+    # Shutdown processor
+    if processor:
+        processor.shutdown()
+
+    logger.info("✓ Shutdown complete")
 
 
 # ==========================================
@@ -129,118 +196,6 @@ app.add_middleware(
 
 
 # ==========================================
-# Mock Data Generator (temporary)
-# ==========================================
-
-async def mock_data_broadcaster():
-    """Broadcast mock metrics to all connected WebSocket clients"""
-    import random
-
-    # Initial values
-    metrics_state = {
-        "Muse_1": {
-            "1s": 2.0,
-            "2s": 1.8,
-            "4s": 1.6
-        },
-        "Muse_2": {
-            "1s": 1.5,
-            "2s": 1.6,
-            "4s": 1.7
-        }
-    }
-
-    while True:
-        try:
-            if ws_manager.active_connections:
-                # Random walk the metrics
-                for device in metrics_state:
-                    for timescale in metrics_state[device]:
-                        # Random walk: ±0.05
-                        change = (random.random() - 0.5) * 0.1
-                        metrics_state[device][timescale] += change
-                        # Clamp to 0-4 range
-                        metrics_state[device][timescale] = max(0.5, min(3.5, metrics_state[device][timescale]))
-
-                # Build message
-                message = {
-                    "type": "feedback_update",
-                    "timestamp": time.time(),
-                    "devices": {
-                        "Muse_1": {
-                            "subject": "Alice",
-                            "frontal": {
-                                "1s": {
-                                    "relaxation": round(metrics_state["Muse_1"]["1s"], 2),
-                                    "alpha": 0.45,
-                                    "beta": 0.32
-                                },
-                                "2s": {
-                                    "relaxation": round(metrics_state["Muse_1"]["2s"], 2),
-                                    "alpha": 0.42,
-                                    "beta": 0.35
-                                },
-                                "4s": {
-                                    "relaxation": round(metrics_state["Muse_1"]["4s"], 2),
-                                    "alpha": 0.38,
-                                    "beta": 0.37
-                                }
-                            },
-                            "quality": {
-                                "data_age_ms": random.randint(30, 80),
-                                "signal_quality": {
-                                    "TP9": 0.95,
-                                    "AF7": 0.88,
-                                    "AF8": 0.92,
-                                    "TP10": 0.97
-                                }
-                            }
-                        },
-                        "Muse_2": {
-                            "subject": "Bob",
-                            "frontal": {
-                                "1s": {
-                                    "relaxation": round(metrics_state["Muse_2"]["1s"], 2),
-                                    "alpha": 0.35,
-                                    "beta": 0.41
-                                },
-                                "2s": {
-                                    "relaxation": round(metrics_state["Muse_2"]["2s"], 2),
-                                    "alpha": 0.36,
-                                    "beta": 0.40
-                                },
-                                "4s": {
-                                    "relaxation": round(metrics_state["Muse_2"]["4s"], 2),
-                                    "alpha": 0.38,
-                                    "beta": 0.38
-                                }
-                            },
-                            "quality": {
-                                "data_age_ms": random.randint(40, 90),
-                                "signal_quality": {
-                                    "TP9": 0.91,
-                                    "AF7": 0.85,
-                                    "AF8": 0.89,
-                                    "TP10": 0.93
-                                }
-                            }
-                        }
-                    }
-                }
-
-                await ws_manager.broadcast(json.dumps(message))
-
-            # Run at 10 Hz
-            await asyncio.sleep(0.1)
-
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"Error in mock data broadcaster: {e}")
-            await asyncio.sleep(1)
-
-
-# ==========================================
 # REST API Endpoints
 # ==========================================
 
@@ -250,90 +205,215 @@ async def root():
     return {
         "status": "running",
         "version": "1.0.0",
-        "service": "ExG-Lab Backend"
+        "service": "ExG-Lab Backend",
+        "lsl_enabled": True
     }
 
 
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint"""
-    return {
+    health = {
         "status": "healthy",
         "timestamp": time.time(),
-        "websocket_clients": len(ws_manager.active_connections)
+        "websocket_clients": len(ws_manager.active_connections),
+        "connected_devices": len(stream_handlers),
+        "session_active": session_manager.current_session is not None if session_manager else False
     }
+
+    # Add performance stats if available
+    if rate_controller:
+        health["performance"] = rate_controller.get_performance_stats()
+
+    return health
 
 
 @app.get("/api/devices/scan")
 async def scan_devices():
     """Scan for available Muse devices"""
-    # TODO: Implement real muselsl scan with bugfixes
-    # For now, return mock devices
-    logger.info("Scanning for devices (mock)")
+    logger.info("Scanning for devices...")
 
-    mock_devices = [
-        {
-            "name": "Muse S - 3C4F",
-            "address": "00:55:DA:B3:3C:4F",
-            "status": "available",
-            "battery": 87
-        },
-        {
-            "name": "Muse S - 7A21",
-            "address": "00:55:DA:B3:7A:21",
-            "status": "available",
-            "battery": 72
-        },
-        {
-            "name": "Muse S - 9B15",
-            "address": "00:55:DA:B3:9B:15",
-            "status": "available",
-            "battery": 94
+    try:
+        devices = device_manager.scan_devices(timeout=5.0)
+
+        return {
+            "success": True,
+            "devices": [
+                {
+                    "name": dev.name,
+                    "address": dev.address,
+                    "status": "available"
+                }
+                for dev in devices
+            ]
         }
-    ]
 
-    return {"devices": mock_devices}
+    except Exception as e:
+        logger.error(f"Error scanning devices: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/devices/connect")
 async def connect_device(request: ConnectRequest):
-    """Connect to a Muse device"""
+    """Connect to a Muse device and start LSL stream"""
+    global rate_controller, ui_broadcast_task
+
     logger.info(f"Connecting device: {request.stream_name} at {request.address}")
 
-    # TODO: Implement real muselsl stream connection
-    # For now, simulate success
-    await asyncio.sleep(0.5)  # Simulate connection delay
+    try:
+        # Start muselsl subprocess
+        success = device_manager.connect_device(
+            address=request.address,
+            stream_name=request.stream_name
+        )
 
-    return {
-        "success": True,
-        "stream_name": request.stream_name,
-        "address": request.address
-    }
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to start muselsl stream")
+
+        # Wait for LSL stream to appear (up to 10 seconds)
+        await asyncio.sleep(2.0)  # Give muselsl time to establish connection
+
+        # Create stream handler
+        handler = LSLStreamHandler(stream_name=request.stream_name)
+        stream_started = handler.start(timeout=10.0)
+
+        if not stream_started:
+            device_manager.disconnect_device(request.stream_name)
+            raise HTTPException(status_code=500, detail="Failed to connect to LSL stream")
+
+        # Store handler
+        stream_handlers[request.stream_name] = handler
+
+        # Update session manager available devices
+        session_manager.devices = list(stream_handlers.keys())
+
+        # Start rate controller if first device
+        if len(stream_handlers) == 1:
+            rate_controller = RateController(
+                stream_handlers=stream_handlers,
+                processor=processor,
+                calc_rate_hz=10.0
+            )
+            rate_controller.start()
+
+            # Start UI broadcast loop
+            ui_broadcast_task = asyncio.create_task(
+                ui_broadcast_loop(rate_controller, ws_manager, broadcast_rate_hz=10.0)
+            )
+
+            logger.info("✓ Rate controller and UI broadcast started")
+        else:
+            # Update rate controller with new handlers
+            rate_controller.stream_handlers = stream_handlers
+
+        logger.info(f"✓ Device connected: {request.stream_name}")
+
+        return {
+            "success": True,
+            "stream_name": request.stream_name,
+            "address": request.address,
+            "total_devices": len(stream_handlers)
+        }
+
+    except Exception as e:
+        logger.error(f"Error connecting device: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/devices/disconnect/{stream_name}")
 async def disconnect_device(stream_name: str):
     """Disconnect a device"""
+    global rate_controller
+
     logger.info(f"Disconnecting device: {stream_name}")
 
-    # TODO: Implement real device disconnection
-    return {"success": True, "stream_name": stream_name}
+    try:
+        # Stop stream handler
+        if stream_name in stream_handlers:
+            stream_handlers[stream_name].stop()
+            del stream_handlers[stream_name]
+
+        # Stop muselsl subprocess
+        device_manager.disconnect_device(stream_name)
+
+        # Update session manager
+        session_manager.devices = list(stream_handlers.keys())
+
+        # Stop rate controller if no devices left
+        if len(stream_handlers) == 0 and rate_controller:
+            rate_controller.stop()
+            rate_controller = None
+
+            # Cancel UI broadcast
+            if ui_broadcast_task:
+                ui_broadcast_task.cancel()
+
+            logger.info("✓ Rate controller stopped (no devices)")
+        elif rate_controller:
+            # Update rate controller handlers
+            rate_controller.stream_handlers = stream_handlers
+
+        return {
+            "success": True,
+            "stream_name": stream_name,
+            "remaining_devices": len(stream_handlers)
+        }
+
+    except Exception as e:
+        logger.error(f"Error disconnecting device: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/devices/status")
+async def get_device_status():
+    """Get status of all connected devices"""
+    status = {}
+
+    for device_name, handler in stream_handlers.items():
+        status[device_name] = handler.get_stream_info()
+
+    return {
+        "success": True,
+        "devices": status
+    }
+
+
+@app.get("/api/protocols")
+async def list_protocols():
+    """List available experimental protocols"""
+    protocols = session_manager.list_protocols()
+
+    return {
+        "success": True,
+        "protocols": protocols
+    }
 
 
 @app.post("/api/session/start")
-async def start_session(config: SessionConfig):
-    """Start a new session"""
-    session_id = f"session_{int(time.time())}"
-    logger.info(f"Starting session: {session_id}")
-    logger.info(f"  Devices: {config.devices}")
-    logger.info(f"  Participants: {config.participants}")
-    logger.info(f"  Protocol: {config.protocol}")
+async def start_session(config: SessionConfigRequest):
+    """Start a new experimental session"""
+    logger.info(f"Starting session with protocol: {config.protocol_name}")
 
-    # TODO: Implement real session management
-    return {
-        "session_id": session_id,
-        "status": "active"
-    }
+    try:
+        session_id = session_manager.start_session(
+            protocol_name=config.protocol_name,
+            subject_ids=config.subject_ids,
+            notes=config.notes,
+            experimenter=config.experimenter
+        )
+
+        if session_id is None:
+            raise HTTPException(status_code=400, detail="Failed to start session")
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "status": "active"
+        }
+
+    except Exception as e:
+        logger.error(f"Error starting session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/session/end")
@@ -341,22 +421,79 @@ async def end_session():
     """End current session"""
     logger.info("Ending session")
 
-    # TODO: Save session data
-    session_dir = f"./data/session_{int(time.time())}"
+    try:
+        success = session_manager.stop_session()
+
+        if not success:
+            raise HTTPException(status_code=400, detail="No active session")
+
+        return {
+            "success": True
+        }
+
+    except Exception as e:
+        logger.error(f"Error ending session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/session/status")
+async def get_session_status():
+    """Get current session status"""
+    status = session_manager.get_session_status()
 
     return {
         "success": True,
-        "session_dir": session_dir
+        "is_active": status.is_active,
+        "session_id": status.session_id,
+        "protocol_name": status.protocol_name,
+        "current_phase": status.current_phase.value,
+        "phase_name": status.phase_name,
+        "elapsed_seconds": status.elapsed_seconds,
+        "remaining_seconds": status.remaining_seconds,
+        "devices": status.devices,
+        "subject_ids": status.subject_ids,
+        "feedback_enabled": session_manager.is_feedback_enabled(),
+        "instructions": session_manager.get_current_instructions()
     }
 
 
 @app.post("/api/session/marker")
-async def insert_marker(marker: dict):
+async def insert_marker(marker: MarkerRequest):
     """Insert event marker"""
-    logger.info(f"Inserting marker: {marker.get('label')}")
+    logger.info(f"Inserting marker: {marker.label}")
 
-    # TODO: Save marker to session data
-    return {"success": True}
+    # TODO: Implement marker storage in data recorder
+    # For now, just log it
+
+    return {
+        "success": True,
+        "timestamp": marker.timestamp or time.time()
+    }
+
+
+@app.get("/api/sessions")
+async def list_sessions():
+    """List all recorded sessions"""
+    sessions = data_recorder.list_sessions()
+
+    return {
+        "success": True,
+        "sessions": sessions
+    }
+
+
+@app.get("/api/sessions/{session_id}")
+async def get_session_metadata(session_id: str):
+    """Get metadata for specific session"""
+    metadata = data_recorder.get_session_metadata(session_id)
+
+    if metadata is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return {
+        "success": True,
+        "metadata": metadata
+    }
 
 
 # ==========================================
