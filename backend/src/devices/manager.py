@@ -10,12 +10,17 @@ This module manages the lifecycle of Muse EEG devices using muselsl:
 Known Issues:
 - muselsl v2.2.2 has bugs with bluetoothctl (see docs/07-muselsl-bugfixes.md)
 - Our fork includes fixes for EOF handling and filename processing
+
+Environment Variables:
+- MUSELSL_PATH: Custom path to muselsl binary (default: system PATH)
+- EXG_REQUIRE_HARDWARE: Raise error if no real devices found (default: true)
 """
 
 import subprocess
 import logging
 import time
 import re
+import os
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 import asyncio
@@ -54,10 +59,77 @@ class DeviceManager:
     """
 
     def __init__(self):
-        """Initialize device manager"""
+        """
+        Initialize device manager with hardware validation.
+
+        Raises:
+            RuntimeError: If muselsl is not available and EXG_REQUIRE_HARDWARE=true
+        """
         self.connected_processes: Dict[str, subprocess.Popen] = {}
         self.device_info: Dict[str, Device] = {}
+
+        # Get muselsl path
+        # Try venv first (if running from venv), then fall back to system PATH
+        import sys
+        venv_muselsl = os.path.join(os.path.dirname(sys.executable), 'muselsl')
+        if os.path.exists(venv_muselsl):
+            self.muselsl_cmd = venv_muselsl
+        else:
+            self.muselsl_cmd = os.environ.get('MUSELSL_PATH', 'muselsl')
+
+        # Check if hardware is required (default: true for production)
+        self.require_hardware = os.environ.get('EXG_REQUIRE_HARDWARE', 'true').lower() == 'true'
+
+        # Validate muselsl availability
+        self._validate_muselsl()
+
         logger.info("DeviceManager initialized")
+
+    def _validate_muselsl(self):
+        """
+        Validate that muselsl is available and check version.
+
+        Raises:
+            RuntimeError: If muselsl not found and hardware is required
+        """
+        try:
+            # Check if muselsl is available
+            result = subprocess.run(
+                [self.muselsl_cmd, '--version'],
+                capture_output=True,
+                text=True,
+                timeout=5.0
+            )
+
+            if result.returncode == 0:
+                version = result.stdout.strip()
+                logger.info(f"muselsl found: {version}")
+
+                # Warn about known buggy versions
+                if '2.2.2' in version:
+                    logger.warning(
+                        "muselsl v2.2.2 has known bugs (bluetoothctl EOF handling). "
+                        "See docs/07-muselsl-bugfixes.md for workarounds."
+                    )
+            else:
+                logger.warning(f"muselsl version check failed: {result.stderr}")
+
+        except FileNotFoundError:
+            error_msg = (
+                f"muselsl not found at '{self.muselsl_cmd}'. "
+                "Install with: pip install muselsl\n"
+                "Or set custom path: export MUSELSL_PATH=/path/to/muselsl\n"
+                "For development without hardware: export EXG_REQUIRE_HARDWARE=false"
+            )
+
+            if self.require_hardware:
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
+            else:
+                logger.warning(f"{error_msg}\nContinuing in development mode (hardware not required)")
+
+        except Exception as e:
+            logger.warning(f"muselsl validation failed: {e}")
 
     def scan_devices(self, timeout: float = 5.0) -> List[Device]:
         """
@@ -69,41 +141,89 @@ class DeviceManager:
         Returns:
             List of discovered Device objects
 
+        Raises:
+            RuntimeError: If muselsl is not available (only if EXG_REQUIRE_HARDWARE=true)
+
         Note:
             This wraps `muselsl list` which has known bugs in v2.2.2:
             - May fail with EOF error on some systems
-            - Our fork includes workarounds (see docs/07-muselsl-bugfixes.md)
+            - See docs/07-muselsl-bugfixes.md for workarounds
         """
         logger.info(f"Scanning for Muse devices (timeout={timeout}s)...")
 
         try:
             # Run muselsl list command
             result = subprocess.run(
-                ['muselsl', 'list'],
+                [self.muselsl_cmd, 'list'],
                 capture_output=True,
                 text=True,
                 timeout=timeout + 2,  # Extra buffer for process overhead
             )
 
             if result.returncode != 0:
-                logger.error(f"muselsl list failed: {result.stderr}")
-                return self._get_mock_devices()  # Fallback for testing
+                error_msg = f"muselsl list failed (exit code {result.returncode}): {result.stderr}"
+                logger.error(error_msg)
+
+                # Check if it's a Bluetooth issue
+                if 'bluetooth' in result.stderr.lower() or 'hci' in result.stderr.lower():
+                    logger.error(
+                        "Bluetooth may not be enabled. Try:\n"
+                        "  sudo systemctl start bluetooth\n"
+                        "  sudo bluetoothctl power on"
+                    )
+
+                if self.require_hardware:
+                    raise RuntimeError(error_msg)
+                else:
+                    logger.warning("Returning empty device list (development mode)")
+                    return []
 
             # Parse output
             devices = self._parse_muselsl_list_output(result.stdout)
             logger.info(f"Found {len(devices)} Muse device(s)")
 
+            if len(devices) == 0:
+                logger.warning(
+                    "No Muse devices found. Make sure:\n"
+                    "  1. Muse headband is turned on (LED should be solid white/blue)\n"
+                    "  2. Bluetooth is enabled on your system\n"
+                    "  3. Device is in pairing mode (hold power button for 5 seconds)"
+                )
+
             return devices
 
         except subprocess.TimeoutExpired:
-            logger.warning(f"Device scan timed out after {timeout}s")
-            return []
+            error_msg = f"Device scan timed out after {timeout}s"
+            logger.error(error_msg)
+
+            if self.require_hardware:
+                raise RuntimeError(error_msg)
+            else:
+                logger.warning("Returning empty device list (development mode)")
+                return []
+
         except FileNotFoundError:
-            logger.error("muselsl command not found - is it installed?")
-            return self._get_mock_devices()  # Fallback for development
+            error_msg = (
+                f"muselsl command not found at '{self.muselsl_cmd}'. "
+                "This should have been caught in _validate_muselsl()"
+            )
+            logger.error(error_msg)
+
+            if self.require_hardware:
+                raise RuntimeError(error_msg)
+            else:
+                logger.warning("Returning empty device list (development mode)")
+                return []
+
         except Exception as e:
-            logger.error(f"Device scan error: {e}")
-            return []
+            error_msg = f"Device scan error: {e}"
+            logger.error(error_msg)
+
+            if self.require_hardware:
+                raise RuntimeError(error_msg)
+            else:
+                logger.warning("Returning empty device list (development mode)")
+                return []
 
     def _parse_muselsl_list_output(self, output: str) -> List[Device]:
         """
@@ -173,7 +293,7 @@ class DeviceManager:
             # Command: muselsl stream --address <MAC> --name <STREAM_NAME>
             process = subprocess.Popen(
                 [
-                    'muselsl', 'stream',
+                    self.muselsl_cmd, 'stream',
                     '--address', address,
                     '--name', stream_name,
                 ],
@@ -315,35 +435,6 @@ class DeviceManager:
             self.disconnect_device(stream_name)
 
         logger.info("All devices disconnected")
-
-    def _get_mock_devices(self) -> List[Device]:
-        """
-        Return mock devices for testing/development.
-
-        Used as fallback when muselsl is not available or scanning fails.
-        """
-        logger.info("Returning mock devices (muselsl not available)")
-
-        return [
-            Device(
-                name="Muse S - 3C4F",
-                address="00:55:DA:B3:3C4F",
-                status="available",
-                battery=87
-            ),
-            Device(
-                name="Muse S - 7A21",
-                address="00:55:DA:B3:7A:21",
-                status="available",
-                battery=72
-            ),
-            Device(
-                name="Muse S - 9B15",
-                address="00:55:DA:B3:9B15",
-                status="available",
-                battery=94
-            ),
-        ]
 
     def __del__(self):
         """Cleanup on destruction"""
