@@ -74,14 +74,6 @@ export function SessionProgress({ isActive, onEndSession, onInsertMarker }: Sess
         </div>
       </div>
 
-      {/* Instructions */}
-      {status.instructions && (
-        <div className="bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-800 rounded-lg p-4">
-          <p className="text-sm font-medium text-blue-900 dark:text-blue-100 mb-1">👁️ Current Instructions</p>
-          <p className="text-sm text-blue-700 dark:text-blue-300">{status.instructions}</p>
-        </div>
-      )}
-
       {/* Feedback Status */}
       <div className="flex items-center justify-between text-xs">
         <span className="text-muted-foreground">Feedback</span>
