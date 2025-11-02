@@ -58,15 +58,19 @@ export function RawDataViewer({ rawData, connectedDevices }: RawDataViewerProps)
                           </span>
                         </div>
                         <div className="h-24 bg-background rounded border border-border relative overflow-hidden">
-                          <svg className="w-full h-full" preserveAspectRatio="none">
+                          <svg className="w-full h-full" preserveAspectRatio="none" viewBox="0 0 100 100">
                             <polyline
                               fill="none"
                               stroke="hsl(var(--primary))"
-                              strokeWidth="1.5"
+                              strokeWidth="0.5"
                               points={data.channels[channel].timeDomain
                                 .map((value, i) => {
-                                  const x = (i / 256) * 100
-                                  const y = 50 - (value / 50) * 40 // Scale to fit
+                                  const numSamples = data.channels[channel].timeDomain.length
+                                  const x = (i / (numSamples - 1)) * 100
+                                  // Auto-scale based on data range
+                                  const maxVal = Math.max(...data.channels[channel].timeDomain.map(Math.abs))
+                                  const scale = maxVal > 0 ? 40 / maxVal : 1
+                                  const y = 50 - value * scale
                                   return `${x},${y}`
                                 })
                                 .join(" ")}
@@ -79,7 +83,7 @@ export function RawDataViewer({ rawData, connectedDevices }: RawDataViewerProps)
                               x2="100"
                               y2="50"
                               stroke="hsl(var(--muted-foreground))"
-                              strokeWidth="0.5"
+                              strokeWidth="0.3"
                               strokeDasharray="2,2"
                               opacity="0.3"
                             />

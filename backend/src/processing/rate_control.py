@@ -466,6 +466,20 @@ async def ui_broadcast_loop(
                 device_status = session_manager.get_session_devices()
                 metrics_dict["device_status"] = device_status
 
+            # Add raw EEG data for visualization (1 second window)
+            raw_data = {}
+            for device_name, handler in rate_controller.stream_handlers.items():
+                data = handler.get_recent_data(duration=1.0)  # 1 second = 256 samples @ 256 Hz
+                if data is not None:
+                    # Convert numpy arrays to lists for JSON serialization
+                    # Downsample by factor of 2 to reduce WebSocket bandwidth (128 samples for 1s display)
+                    raw_data[device_name] = {
+                        ch_name: samples[::2].tolist()  # Every 2nd sample = 128 points
+                        for ch_name, samples in data.items()
+                    }
+
+            metrics_dict["raw_data"] = raw_data
+
             metrics_json = json.dumps(metrics_dict)
 
             # Broadcast to all connected WebSocket clients
