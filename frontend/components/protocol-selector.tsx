@@ -1,55 +1,78 @@
 "use client"
 
-import { Clock, Layers, Eye, Hash } from "lucide-react"
+import { useState, useEffect } from "react"
+import { Clock, Layers, Eye, Loader2 } from "lucide-react"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import type { Protocol } from "@/types"
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+
 interface ProtocolSelectorProps {
   onSelectProtocol: (protocol: Protocol) => void
 }
 
-const PROTOCOLS: Protocol[] = [
-  {
-    id: "meditation-baseline",
-    name: "Meditation Baseline",
-    description: "Pure data recording without feedback. Ideal for establishing participant baselines.",
-    phases: 1,
-    duration: 300,
-    feedbackEnabled: false,
-    timescales: 1,
-  },
-  {
-    id: "neurofeedback-training",
-    name: "Neurofeedback Training",
-    description: "Standard 3-phase protocol: pre-baseline, active training with full feedback, post-assessment.",
-    phases: 3,
-    duration: 800,
-    feedbackEnabled: true,
-    timescales: 3,
-  },
-  {
-    id: "multi-subject-sync",
-    name: "Multi-Subject Synchronized",
-    description: "4-person synchronized training session with group baseline and coordinated feedback.",
-    phases: 2,
-    duration: 1080,
-    feedbackEnabled: true,
-    timescales: 1,
-  },
-  {
-    id: "ab-test-timescale",
-    name: "A/B Test: Timescale Comparison",
-    description: "Compare effectiveness of different feedback timescales across experimental groups.",
-    phases: 2,
-    duration: 780,
-    feedbackEnabled: true,
-    timescales: 0,
-  },
-]
-
 export function ProtocolSelector({ onSelectProtocol }: ProtocolSelectorProps) {
+  const [protocols, setProtocols] = useState<Protocol[]>([])
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    const fetchProtocols = async () => {
+      try {
+        const response = await fetch(`${API_URL}/api/protocols`)
+        const data = await response.json()
+
+        if (data.success && data.protocols) {
+          // Transform backend protocol format to frontend format
+          const transformedProtocols: Protocol[] = data.protocols.map((p: any) => ({
+            id: p.name.toLowerCase().replace(/\s+/g, "-"),
+            name: p.name,
+            description: p.description,
+            phases: p.num_phases,
+            duration: p.duration_seconds,
+            feedbackEnabled: p.num_phases > 1, // Heuristic: multi-phase protocols typically have feedback
+            timescales: 3, // Default to 3 timescales (1s, 2s, 4s)
+            minDevices: p.min_devices,
+            maxDevices: p.max_devices,
+          }))
+          setProtocols(transformedProtocols)
+          setError(null)
+        } else {
+          setError("Failed to load protocols")
+        }
+      } catch (err) {
+        console.error("Error fetching protocols:", err)
+        setError("Failed to fetch protocols from server")
+      } finally {
+        setIsLoading(false)
+      }
+    }
+
+    fetchProtocols()
+  }, [])
+
+  if (isLoading) {
+    return (
+      <div className="p-8 max-w-6xl mx-auto flex items-center justify-center min-h-[400px]">
+        <div className="text-center">
+          <Loader2 className="h-8 w-8 animate-spin text-primary mx-auto mb-3" />
+          <p className="text-muted-foreground">Loading protocols...</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="p-8 max-w-6xl mx-auto">
+        <Card className="p-6 border-red-200 bg-red-50 dark:bg-red-950/20">
+          <p className="text-red-600 dark:text-red-400">{error}</p>
+        </Card>
+      </div>
+    )
+  }
   const formatDuration = (seconds: number) => {
     const mins = Math.floor(seconds / 60)
     const secs = seconds % 60
@@ -91,12 +114,6 @@ export function ProtocolSelector({ onSelectProtocol }: ProtocolSelectorProps) {
                   <Eye className="h-3 w-3" />
                   {protocol.feedbackEnabled ? "Feedback ON" : "Recording Only"}
                 </Badge>
-                {protocol.timescales > 0 && (
-                  <Badge variant="secondary" className="gap-1.5">
-                    <Hash className="h-3 w-3" />
-                    {protocol.timescales} timescale{protocol.timescales > 1 ? "s" : ""}
-                  </Badge>
-                )}
               </div>
             </div>
           </Card>

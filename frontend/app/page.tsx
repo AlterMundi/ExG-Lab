@@ -239,6 +239,30 @@ export default function ExGLabPage() {
     setReplaySession(session)
   }
 
+  const handleInsertMarker = async (label: string) => {
+    try {
+      const response = await fetch(`${API_URL}/api/session/marker`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          label,
+          timestamp: Date.now() / 1000, // Unix timestamp in seconds
+          metadata: {},
+        }),
+      })
+
+      const data = await response.json()
+
+      if (data.success) {
+        console.log(`✓ Marker inserted: ${label}`)
+      } else {
+        console.error("Failed to insert marker:", data.error || "Unknown error")
+      }
+    } catch (error) {
+      console.error("Error inserting marker:", error)
+    }
+  }
+
   // Convert session devices or scanned devices to Device format for components that expect it
   const connectedDevices: Device[] = sessionState?.isActive
     ? // When session is active, use session devices
@@ -278,7 +302,13 @@ export default function ExGLabPage() {
             </Button>
           )}
 
-          {sessionState?.isActive && <SessionProgress sessionState={sessionState} onEndSession={handleEndSession} />}
+          {sessionState?.isActive && (
+            <SessionProgress
+              isActive={sessionState.isActive}
+              onEndSession={handleEndSession}
+              onInsertMarker={handleInsertMarker}
+            />
+          )}
         </aside>
 
         {/* Main Content */}

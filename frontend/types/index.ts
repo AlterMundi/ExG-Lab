@@ -23,6 +23,8 @@ export interface Protocol {
   duration: number
   feedbackEnabled: boolean
   timescales: number
+  minDevices?: number
+  maxDevices?: number
 }
 
 export interface SessionState {

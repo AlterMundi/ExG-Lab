@@ -1,22 +1,50 @@
 "use client"
 
-import { Clock, AlertTriangle } from "lucide-react"
+import { useState } from "react"
+import { Clock, AlertTriangle, Tag } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
-import type { SessionState } from "@/types"
+import { Input } from "@/components/ui/input"
+import { useSessionStatus } from "@/hooks/use-session-status"
 
 interface SessionProgressProps {
-  sessionState: SessionState
+  isActive: boolean
   onEndSession: () => void
+  onInsertMarker?: (label: string) => void
 }
 
-export function SessionProgress({ sessionState, onEndSession }: SessionProgressProps) {
-  // Mock phase progress
-  const phaseProgress = 46 // 46% through current phase
-  const elapsedTime = "7:42"
-  const totalTime = "10:00"
+export function SessionProgress({ isActive, onEndSession, onInsertMarker }: SessionProgressProps) {
+  const { status } = useSessionStatus(isActive)
+  const [markerLabel, setMarkerLabel] = useState("")
+  const [showMarkerInput, setShowMarkerInput] = useState(false)
+
+  if (!status || !status.isActive) {
+    return null
+  }
+
+  // Format time as MM:SS
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60)
+    const secs = Math.floor(seconds % 60)
+    return `${mins}:${secs.toString().padStart(2, "0")}`
+  }
+
+  // Calculate phase progress percentage
+  const totalDuration = status.elapsedSeconds + (status.remainingSeconds || 0)
+  const phaseProgress = totalDuration > 0 ? (status.elapsedSeconds / totalDuration) * 100 : 0
+
+  // Get phase display
+  const phaseDisplay = status.phaseName || status.currentPhase
+
+  const handleInsertMarker = () => {
+    if (markerLabel.trim() && onInsertMarker) {
+      onInsertMarker(markerLabel.trim())
+      setMarkerLabel("")
+      setShowMarkerInput(false)
+    }
+  }
 
   return (
     <Card className="p-6 space-y-4">
@@ -25,30 +53,73 @@ export function SessionProgress({ sessionState, onEndSession }: SessionProgressP
         <Clock className="h-5 w-5 text-muted-foreground" />
       </div>
 
+      {/* Session Info */}
+      <div className="space-y-1">
+        <p className="text-xs text-muted-foreground">Protocol</p>
+        <p className="font-medium text-sm">{status.protocolName}</p>
+      </div>
+
+      {/* Phase Progress */}
       <div className="space-y-2">
         <div className="flex items-center justify-between text-sm">
-          <span className="font-medium text-foreground">Active Training</span>
-          <Badge variant="secondary">Phase 2/3</Badge>
+          <span className="font-medium text-foreground">{phaseDisplay}</span>
+          <Badge variant="secondary" className="capitalize">
+            {status.currentPhase.replace("_", " ")}
+          </Badge>
         </div>
         <Progress value={phaseProgress} className="h-2" />
         <div className="flex items-center justify-between text-xs text-muted-foreground">
-          <span>{elapsedTime}</span>
-          <span>{totalTime}</span>
+          <span>{formatTime(status.elapsedSeconds)}</span>
+          <span>{formatTime(totalDuration)}</span>
         </div>
       </div>
 
-      <div className="bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-800 rounded-lg p-4">
-        <p className="text-sm font-medium text-blue-900 dark:text-blue-100 mb-1">👁️ Current Instructions</p>
-        <p className="text-sm text-blue-700 dark:text-blue-300">Try to increase the balanced (yellow) bar</p>
+      {/* Instructions */}
+      {status.instructions && (
+        <div className="bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-800 rounded-lg p-4">
+          <p className="text-sm font-medium text-blue-900 dark:text-blue-100 mb-1">👁️ Current Instructions</p>
+          <p className="text-sm text-blue-700 dark:text-blue-300">{status.instructions}</p>
+        </div>
+      )}
+
+      {/* Feedback Status */}
+      <div className="flex items-center justify-between text-xs">
+        <span className="text-muted-foreground">Feedback</span>
+        <Badge variant={status.feedbackEnabled ? "default" : "secondary"} className="text-xs">
+          {status.feedbackEnabled ? "ON" : "OFF"}
+        </Badge>
       </div>
 
+      {/* Actions */}
       <div className="space-y-2">
-        <Button variant="outline" size="sm" className="w-full bg-transparent">
-          Insert Marker
-        </Button>
-        <Button variant="outline" size="sm" className="w-full bg-transparent">
-          Adjust Parameters
-        </Button>
+        {showMarkerInput ? (
+          <div className="flex gap-2">
+            <Input
+              placeholder="Marker label..."
+              value={markerLabel}
+              onChange={(e) => setMarkerLabel(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleInsertMarker()
+                if (e.key === "Escape") setShowMarkerInput(false)
+              }}
+              className="text-sm"
+              autoFocus
+            />
+            <Button size="sm" onClick={handleInsertMarker} disabled={!markerLabel.trim()}>
+              Add
+            </Button>
+          </div>
+        ) : (
+          <Button
+            variant="outline"
+            size="sm"
+            className="w-full bg-transparent"
+            onClick={() => setShowMarkerInput(true)}
+          >
+            <Tag className="h-4 w-4 mr-2" />
+            Insert Marker
+          </Button>
+        )}
       </div>
 
       <Button variant="destructive" size="sm" className="w-full" onClick={onEndSession}>
