@@ -89,7 +89,7 @@ export function ProtocolSelector({ onSelectProtocol }: ProtocolSelectorProps) {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
-        {PROTOCOLS.map((protocol) => (
+        {protocols.map((protocol) => (
           <Card
             key={protocol.id}
             className="p-6 cursor-pointer hover:border-primary hover:shadow-lg transition-all"
