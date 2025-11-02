@@ -1,9 +1,18 @@
 export interface Device {
   name: string
   mac: string
-  status: "available" | "connected" | "streaming"
+  status: "available" | "connected" | "streaming" | "connecting"
   battery: number | null
   streamName: string | null
+}
+
+export interface SessionDevice {
+  address: string
+  name: string
+  streamName: string
+  status: "connected" | "streaming" | "disconnected"
+  connectedAt: number
+  disconnectedAt: number | null
 }
 
 export interface Protocol {
@@ -17,11 +26,18 @@ export interface Protocol {
 }
 
 export interface SessionState {
-  sessionId: string
-  config: any
-  currentPhase: number
-  phaseStartTime: number
   isActive: boolean
+  sessionId: string | null
+  protocolName: string | null
+  currentPhase: string
+  phaseName: string | null
+  elapsedSeconds: number
+  remainingSeconds: number | null
+  devices: string[]  // Stream names
+  subjectIds: Record<string, string>
+  connectedDevices: SessionDevice[]  // Full device state
+  feedbackEnabled: boolean
+  instructions: string | null
 }
 
 export interface DeviceMetrics {

@@ -38,7 +38,7 @@ import threading
 from typing import Optional, List, Tuple, Dict
 from collections import deque
 import numpy as np
-from pylsl import StreamInlet, resolve_byprop
+from pylsl import StreamInlet, resolve_byprop, resolve_streams
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +115,21 @@ class LSLStreamHandler:
 
             if not streams:
                 logger.error(f"Stream '{self.stream_name}' not found within {timeout}s")
+
+                # DIAGNOSTIC: List all available LSL streams
+                logger.info("Listing ALL available LSL streams for diagnosis...")
+                all_streams = resolve_streams(timeout=2.0)
+
+                if not all_streams:
+                    logger.warning("  No LSL streams found at all!")
+                    logger.warning("  This suggests muselsl hasn't published the stream yet, or there's a network issue")
+                else:
+                    logger.info(f"  Found {len(all_streams)} total LSL stream(s):")
+                    for i, stream in enumerate(all_streams):
+                        info = stream
+                        logger.info(f"    [{i+1}] name='{info.name()}' type='{info.type()}' source_id='{info.source_id()}'")
+                        logger.info(f"         hostname='{info.hostname()}' channels={info.channel_count()} rate={info.nominal_srate()} Hz")
+
                 return False
 
             # Create inlet

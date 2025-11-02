@@ -369,15 +369,15 @@ class RateController:
         Converts DeviceMetrics to frontend-compatible format.
 
         Returns:
-            JSON string matching frontend interface
+            JSON string matching frontend interface (wrapped in object for extensibility)
         """
         metrics = self.get_latest_metrics()
 
-        # Convert to frontend format
-        output = []
+        # Convert to frontend format (array of device metrics)
+        devices = []
 
         for device_name, m in metrics.items():
-            output.append({
+            devices.append({
                 'subject': m.subject,
                 'frontal': {
                     '1s': m.frontal_1s,
@@ -389,6 +389,12 @@ class RateController:
                     'signal_quality': m.signal_quality
                 }
             })
+
+        # Wrap in object to allow additional fields (e.g., device_status, session_info)
+        output = {
+            'devices': devices,
+            'timestamp': time.time()
+        }
 
         return json.dumps(output)
 
@@ -414,10 +420,11 @@ class RateController:
 async def ui_broadcast_loop(
     rate_controller: RateController,
     websocket_manager: 'WebSocketManager',
+    session_manager: Optional['SessionManager'] = None,
     broadcast_rate_hz: float = 10.0
 ):
     """
-    Asyncio task for broadcasting metrics to WebSocket clients.
+    Asyncio task for broadcasting metrics and device status to WebSocket clients.
 
     This runs in FastAPI's asyncio event loop and bridges the calc thread
     (pure threading) with WebSocket clients (asyncio).
@@ -425,13 +432,14 @@ async def ui_broadcast_loop(
     Args:
         rate_controller: RateController instance
         websocket_manager: WebSocketManager instance from main.py
+        session_manager: Optional SessionManager instance for device status
         broadcast_rate_hz: Broadcast rate in Hz (default 10.0 = 100ms intervals)
 
     Usage in main.py:
         @app.on_event("startup")
         async def startup():
             asyncio.create_task(
-                ui_broadcast_loop(rate_controller, websocket_manager)
+                ui_broadcast_loop(rate_controller, websocket_manager, session_manager)
             )
     """
     logger.info(f"UI broadcast loop started ({broadcast_rate_hz} Hz)")
@@ -443,7 +451,22 @@ async def ui_broadcast_loop(
             loop_start = time.time()
 
             # Get latest metrics (thread-safe read from shared state)
-            metrics_json = rate_controller.get_metrics_json()
+            metrics_data = rate_controller.get_metrics_json()
+
+            # Parse JSON and add additional fields
+            import json
+            metrics_dict = json.loads(metrics_data)
+
+            # Add connected devices list (from stream handlers)
+            connected_devices = list(rate_controller.stream_handlers.keys())
+            metrics_dict["connected_devices"] = connected_devices
+
+            # Add session device status if session manager available
+            if session_manager:
+                device_status = session_manager.get_session_devices()
+                metrics_dict["device_status"] = device_status
+
+            metrics_json = json.dumps(metrics_dict)
 
             # Broadcast to all connected WebSocket clients
             if websocket_manager.active_connections:

@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { Header } from "@/components/header"
 import { DevicePanel } from "@/components/device-panel"
 import { ProtocolSelector } from "@/components/protocol-selector"
@@ -20,7 +20,7 @@ import type { Device, Protocol, SessionState, SavedSession } from "@/types"
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
 
 export default function ExGLabPage() {
-  const [devices, setDevices] = useState<Device[]>([])
+  const [scannedDevices, setScannedDevices] = useState<Device[]>([])
   const [selectedProtocol, setSelectedProtocol] = useState<Protocol | null>(null)
   const [sessionState, setSessionState] = useState<SessionState | null>(null)
   const [isScanning, setIsScanning] = useState(false)
@@ -28,7 +28,7 @@ export default function ExGLabPage() {
   const [replaySession, setReplaySession] = useState<SavedSession | null>(null)
   const [currentView, setCurrentView] = useState<"feedback" | "raw">("feedback")
 
-  const { metrics, isConnected, error } = useRealtimeData()
+  const { metrics, deviceStatus, connectedStreamNames, isConnected, error } = useRealtimeData()
   const rawData = useRawEEGData()
 
   const { saveSession } = useSessionRecorder(
@@ -36,9 +36,25 @@ export default function ExGLabPage() {
     sessionState?.sessionId || null,
     selectedProtocol,
     sessionState?.config,
-    devices,
+    scannedDevices,
     metrics,
   )
+
+  // Update scanned devices status based on connected stream names from WebSocket
+  useEffect(() => {
+    if (connectedStreamNames.length > 0) {
+      setScannedDevices((prev) =>
+        prev.map((device) => ({
+          ...device,
+          status: connectedStreamNames.includes(device.streamName || "")
+            ? "connected"
+            : device.status === "connecting"
+              ? "connecting"
+              : "available",
+        })),
+      )
+    }
+  }, [connectedStreamNames])
 
   const handleScan = async () => {
     setIsScanning(true)
@@ -47,7 +63,7 @@ export default function ExGLabPage() {
       const data = await response.json()
 
       if (data.success && data.devices) {
-        setDevices(
+        setScannedDevices(
           data.devices.map((d: any) => ({
             name: d.name,
             mac: d.address,
@@ -67,8 +83,18 @@ export default function ExGLabPage() {
   }
 
   const handleConnect = async (mac: string) => {
-    const connectedCount = devices.filter((dev) => dev.status === "connected").length
+    // Count currently connected devices from session (not including disconnected)
+    const connectedCount = deviceStatus.filter((dev) => dev.status !== "disconnected").length
     const streamName = `Muse_${connectedCount + 1}`
+
+    // Update device status to "connecting" immediately
+    setScannedDevices((prev) =>
+      prev.map((device) =>
+        device.mac === mac
+          ? { ...device, status: "connecting", streamName }
+          : device,
+      ),
+    )
 
     try {
       const response = await fetch(`${API_URL}/api/devices/connect`, {
@@ -78,67 +104,134 @@ export default function ExGLabPage() {
       })
       const data = await response.json()
 
-      if (data.success) {
-        setDevices((prev) =>
-          prev.map((d) =>
-            d.mac === mac
-              ? {
-                  ...d,
-                  status: "connected",
-                  streamName: streamName,
-                }
-              : d
-          )
-        )
-      } else {
+      if (!data.success) {
         console.error("Device connection failed:", data.error || "Unknown error")
+        // Reset status on failure
+        setScannedDevices((prev) =>
+          prev.map((device) =>
+            device.mac === mac
+              ? { ...device, status: "available", streamName: null }
+              : device,
+          ),
+        )
       }
+      // Note: Device status will be updated via WebSocket once connected
     } catch (error) {
       console.error("Failed to connect device:", error)
+      // Reset status on error
+      setScannedDevices((prev) =>
+        prev.map((device) =>
+          device.mac === mac
+            ? { ...device, status: "available", streamName: null }
+            : device,
+        ),
+      )
     }
   }
 
   const handleDisconnect = async (mac: string) => {
-    const device = devices.find((d) => d.mac === mac)
-    if (!device?.streamName) {
+    // Find device in session devices OR scanned devices
+    const sessionDevice = deviceStatus.find((d) => d.address === mac)
+    const scannedDevice = scannedDevices.find((d) => d.mac === mac)
+
+    const streamName = sessionDevice?.streamName || scannedDevice?.streamName
+
+    if (!streamName) {
       console.error("Cannot disconnect: device has no stream name")
       return
     }
 
     try {
-      const response = await fetch(`${API_URL}/api/devices/disconnect`, {
+      const response = await fetch(`${API_URL}/api/devices/disconnect/${streamName}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stream_name: device.streamName }),
       })
       const data = await response.json()
 
-      if (data.success) {
-        setDevices((prev) =>
-          prev.map((d) => (d.mac === mac ? { ...d, status: "available", streamName: null } : d))
-        )
-      } else {
+      if (!data.success) {
         console.error("Device disconnection failed:", data.error || "Unknown error")
+      } else {
+        // Update scanned device status immediately
+        setScannedDevices((prev) =>
+          prev.map((device) =>
+            device.mac === mac
+              ? { ...device, status: "available", streamName: null }
+              : device,
+          ),
+        )
       }
     } catch (error) {
       console.error("Failed to disconnect device:", error)
     }
   }
 
-  const handleStartSession = (config: any) => {
-    setSessionState({
-      sessionId: `session_${Date.now()}`,
-      config,
-      currentPhase: 0,
-      phaseStartTime: Date.now(),
-      isActive: true,
-    })
+  const handleStartSession = async (config: any) => {
+    try {
+      // Transform assignments to backend format
+      const subjectIds: Record<string, string> = {}
+      config.assignments.forEach((assignment: any) => {
+        subjectIds[assignment.streamName] = assignment.participantName
+      })
+
+      // Call backend API to start session
+      const response = await fetch(`${API_URL}/api/session/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          protocol_name: config.protocol.name,
+          subject_ids: subjectIds,
+          notes: "",
+          experimenter: "",
+        }),
+      })
+
+      const data = await response.json()
+
+      if (data.success && data.session_id) {
+        // Backend session started successfully, update frontend state
+        setSessionState({
+          sessionId: data.session_id,
+          config,
+          currentPhase: 0,
+          phaseStartTime: Date.now(),
+          isActive: true,
+        })
+        console.log("✓ Session started:", data.session_id)
+      } else {
+        console.error("Failed to start session:", data.error || "Unknown error")
+        alert("Failed to start session. Please check the console for details.")
+      }
+    } catch (error) {
+      console.error("Error starting session:", error)
+      alert("Failed to start session. Please check the console for details.")
+    }
   }
 
-  const handleEndSession = () => {
-    saveSession()
-    setSessionState(null)
-    setSelectedProtocol(null)
+  const handleEndSession = async () => {
+    try {
+      // Save session data locally
+      saveSession()
+
+      // Call backend API to end session
+      const response = await fetch(`${API_URL}/api/session/end`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      })
+
+      const data = await response.json()
+
+      if (data.success) {
+        console.log("✓ Session ended successfully")
+      } else {
+        console.error("Failed to end session:", data.error || "Unknown error")
+      }
+    } catch (error) {
+      console.error("Error ending session:", error)
+    } finally {
+      // Always clear frontend state
+      setSessionState(null)
+      setSelectedProtocol(null)
+    }
   }
 
   const handleLoadSession = (session: SavedSession) => {
@@ -146,7 +239,20 @@ export default function ExGLabPage() {
     setReplaySession(session)
   }
 
-  const connectedDevices = devices.filter((d) => d.status === "connected")
+  // Convert session devices or scanned devices to Device format for components that expect it
+  const connectedDevices: Device[] = sessionState?.isActive
+    ? // When session is active, use session devices
+      deviceStatus
+        .filter((d) => d.status !== "disconnected")
+        .map((d) => ({
+          name: d.name,
+          mac: d.address,
+          status: "connected" as const,
+          battery: null,
+          streamName: d.streamName,
+        }))
+    : // When no session, use scanned devices that are connected
+      scannedDevices.filter((d) => d.status === "connected")
 
   return (
     <div className="min-h-screen flex flex-col bg-background">
@@ -156,7 +262,8 @@ export default function ExGLabPage() {
         {/* Left Sidebar */}
         <aside className="w-80 border-r border-border bg-card p-6 space-y-6 overflow-y-auto">
           <DevicePanel
-            devices={devices}
+            scannedDevices={scannedDevices}
+            sessionDevices={deviceStatus}
             isScanning={isScanning}
             onScan={handleScan}
             onConnect={handleConnect}

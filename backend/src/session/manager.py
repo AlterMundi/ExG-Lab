@@ -135,6 +135,7 @@ class SessionConfig:
     protocol: ExperimentalProtocol
     subject_ids: Dict[str, str]  # device_name -> subject_id (e.g., 'Muse_1' -> 'P001')
     start_time: float
+    connected_devices: List[Dict] = field(default_factory=list)  # Full device state with history
     notes: str = ""
     experimenter: str = ""
     metadata: Dict = field(default_factory=dict)
@@ -602,3 +603,103 @@ class SessionManager:
 
         current_phase_config = self.current_session.protocol.phases[self.phase_index]
         return current_phase_config.instructions
+
+    def add_device_to_session(self, address: str, name: str, stream_name: str) -> bool:
+        """
+        Add a connected device to the current session.
+
+        Args:
+            address: Device MAC address (e.g., "00:55:DA:BB:98:C7")
+            name: Device display name (e.g., "Muse S - 98C7")
+            stream_name: LSL stream name (e.g., "Muse_1")
+
+        Returns:
+            True if added successfully, False if no session active
+        """
+        if self.current_session is None:
+            logger.warning("Cannot add device - no active session")
+            return False
+
+        device_info = {
+            "address": address,
+            "name": name,
+            "streamName": stream_name,
+            "status": "connected",
+            "connectedAt": time.time(),
+            "disconnectedAt": None
+        }
+
+        self.current_session.connected_devices.append(device_info)
+        logger.info(f"Device added to session: {stream_name} ({address})")
+        return True
+
+    def update_device_status(self, stream_name: str, status: str) -> bool:
+        """
+        Update status of a device in the current session.
+
+        Args:
+            stream_name: LSL stream name (e.g., "Muse_1")
+            status: New status ("connected", "streaming", "disconnected")
+
+        Returns:
+            True if updated successfully, False if device not found
+        """
+        if self.current_session is None:
+            logger.warning("Cannot update device status - no active session")
+            return False
+
+        for device in self.current_session.connected_devices:
+            if device["streamName"] == stream_name:
+                device["status"] = status
+                if status == "disconnected" and device["disconnectedAt"] is None:
+                    device["disconnectedAt"] = time.time()
+                logger.info(f"Device status updated: {stream_name} -> {status}")
+                return True
+
+        logger.warning(f"Device not found in session: {stream_name}")
+        return False
+
+    def get_session_devices(self) -> List[Dict]:
+        """
+        Get all devices associated with the current session.
+
+        Returns:
+            List of device info dicts, or empty list if no session active
+        """
+        if self.current_session is None:
+            return []
+
+        return self.current_session.connected_devices
+
+    def disconnect_all_devices(self, device_manager: Optional['DeviceManager'] = None) -> None:
+        """
+        Disconnect all devices in the current session.
+
+        Args:
+            device_manager: Optional DeviceManager instance to perform actual disconnection
+
+        Note:
+            This marks all devices as disconnected in session state.
+            If device_manager is provided, also triggers actual device disconnection.
+        """
+        if self.current_session is None:
+            logger.warning("No active session to disconnect devices from")
+            return
+
+        disconnected_count = 0
+        for device in self.current_session.connected_devices:
+            if device["status"] != "disconnected":
+                device["status"] = "disconnected"
+                device["disconnectedAt"] = time.time()
+                disconnected_count += 1
+
+                # Trigger actual disconnection if device_manager provided
+                if device_manager:
+                    stream_name = device["streamName"]
+                    try:
+                        device_manager.disconnect_device(stream_name)
+                        logger.info(f"Disconnected device: {stream_name}")
+                    except Exception as e:
+                        logger.error(f"Failed to disconnect {stream_name}: {e}")
+
+        logger.info(f"Marked {disconnected_count} device(s) as disconnected in session")

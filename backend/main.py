@@ -234,7 +234,7 @@ async def scan_devices():
     logger.info("Scanning for devices...")
 
     try:
-        devices = device_manager.scan_devices(timeout=5.0)
+        devices = await device_manager.scan_devices_async(timeout=10.0)
 
         return {
             "success": True,
@@ -270,22 +270,58 @@ async def connect_device(request: ConnectRequest):
         if not success:
             raise HTTPException(status_code=500, detail="Failed to start muselsl stream")
 
-        # Wait for LSL stream to appear (up to 10 seconds)
-        await asyncio.sleep(2.0)  # Give muselsl time to establish connection
+        # Poll for LSL stream availability (Bluetooth connection can take 10-30 seconds)
+        # Try to resolve stream every 2 seconds for up to 30 seconds total
+        logger.info(f"Waiting for LSL stream '{request.stream_name}' to appear...")
 
-        # Create stream handler
-        handler = LSLStreamHandler(stream_name=request.stream_name)
-        stream_started = handler.start(timeout=10.0)
+        max_wait_time = 30.0  # seconds
+        poll_interval = 2.0  # seconds
+        elapsed = 0.0
 
-        if not stream_started:
+        handler = None
+        while elapsed < max_wait_time:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+            logger.info(f"  Attempting to resolve stream (elapsed: {elapsed:.1f}s / {max_wait_time}s)...")
+
+            # Try to connect to stream
+            handler = LSLStreamHandler(stream_name=request.stream_name)
+            stream_started = handler.start(timeout=poll_interval)
+
+            if stream_started:
+                logger.info(f"✓ LSL stream '{request.stream_name}' found after {elapsed:.1f}s")
+                break
+            else:
+                # Stream not yet available, continue polling
+                handler = None
+
+        if handler is None:
+            # Timeout - stream never appeared
+            logger.error(f"Timeout: LSL stream '{request.stream_name}' did not appear within {max_wait_time}s")
             device_manager.disconnect_device(request.stream_name)
-            raise HTTPException(status_code=500, detail="Failed to connect to LSL stream")
+            raise HTTPException(
+                status_code=500,
+                detail=f"LSL stream did not appear within {max_wait_time}s. Check muselsl logs for Bluetooth connection errors."
+            )
 
         # Store handler
         stream_handlers[request.stream_name] = handler
 
         # Update session manager available devices
         session_manager.devices = list(stream_handlers.keys())
+
+        # Add device to session if session is active
+        if session_manager.current_session is not None:
+            # Reconstruct device name from address (matches scan format)
+            short_id = request.address.replace(':', '')[-4:]
+            device_name = f"Muse S - {short_id}"
+
+            session_manager.add_device_to_session(
+                address=request.address,
+                name=device_name,
+                stream_name=request.stream_name
+            )
 
         # Start rate controller if first device
         if len(stream_handlers) == 1:
@@ -298,7 +334,7 @@ async def connect_device(request: ConnectRequest):
 
             # Start UI broadcast loop
             ui_broadcast_task = asyncio.create_task(
-                ui_broadcast_loop(rate_controller, ws_manager, broadcast_rate_hz=10.0)
+                ui_broadcast_loop(rate_controller, ws_manager, session_manager, broadcast_rate_hz=10.0)
             )
 
             logger.info("✓ Rate controller and UI broadcast started")
@@ -338,6 +374,10 @@ async def disconnect_device(stream_name: str):
 
         # Update session manager
         session_manager.devices = list(stream_handlers.keys())
+
+        # Mark device as disconnected in session if session is active
+        if session_manager.current_session is not None:
+            session_manager.update_device_status(stream_name, "disconnected")
 
         # Stop rate controller if no devices left
         if len(stream_handlers) == 0 and rate_controller:
@@ -405,6 +445,29 @@ async def start_session(config: SessionConfigRequest):
         if session_id is None:
             raise HTTPException(status_code=400, detail="Failed to start session")
 
+        # Register all currently connected devices with the session
+        # This handles the case where devices were connected before session started
+        logger.info(f"Connected stream handlers: {list(stream_handlers.keys())}")
+        logger.info(f"Device info available: {list(device_manager.device_info.keys())}")
+
+        for stream_name, handler in stream_handlers.items():
+            # Get device info from device manager
+            if stream_name in device_manager.device_info:
+                device = device_manager.device_info[stream_name]
+                logger.info(f"Registering device: name={device.name}, address={device.address}, stream={stream_name}")
+
+                session_manager.add_device_to_session(
+                    address=device.address,
+                    name=device.name,
+                    stream_name=stream_name
+                )
+            else:
+                logger.warning(f"Device info not found for stream {stream_name}")
+
+        # Get and log current session devices
+        session_devices = session_manager.get_session_devices()
+        logger.info(f"✓ Session started with {len(session_devices)} registered device(s): {session_devices}")
+
         return {
             "success": True,
             "session_id": session_id,
@@ -418,10 +481,13 @@ async def start_session(config: SessionConfigRequest):
 
 @app.post("/api/session/end")
 async def end_session():
-    """End current session"""
+    """End current session and disconnect all devices"""
     logger.info("Ending session")
 
     try:
+        # Disconnect all devices before stopping session
+        session_manager.disconnect_all_devices(device_manager)
+
         success = session_manager.stop_session()
 
         if not success:
@@ -452,6 +518,7 @@ async def get_session_status():
         "remaining_seconds": status.remaining_seconds,
         "devices": status.devices,
         "subject_ids": status.subject_ids,
+        "connected_devices": session_manager.get_session_devices(),
         "feedback_enabled": session_manager.is_feedback_enabled(),
         "instructions": session_manager.get_current_instructions()
     }

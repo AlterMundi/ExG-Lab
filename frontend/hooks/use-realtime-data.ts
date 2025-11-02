@@ -1,13 +1,15 @@
 "use client"
 
 import { useState, useEffect, useRef } from "react"
-import type { DeviceMetrics } from "@/types"
+import type { DeviceMetrics, SessionDevice } from "@/types"
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000/ws"
 const RECONNECT_DELAY = 3000 // 3 seconds
 
 export function useRealtimeData() {
   const [metrics, setMetrics] = useState<Record<string, DeviceMetrics>>({})
+  const [deviceStatus, setDeviceStatus] = useState<SessionDevice[]>([])
+  const [connectedStreamNames, setConnectedStreamNames] = useState<string[]>([])
   const [isConnected, setIsConnected] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -39,9 +41,31 @@ export function useRealtimeData() {
           const message = JSON.parse(event.data)
 
           // Handle different message types
-          if (message.type === "feedback_update" && message.devices) {
-            // Backend sends: { type: "feedback_update", timestamp: ..., devices: {...} }
+          if (message.devices && Array.isArray(message.devices)) {
+            // New format: { devices: [...], timestamp: ..., connected_devices: [...], device_status: [...] }
+            const devicesObj: Record<string, DeviceMetrics> = {}
+            message.devices.forEach((device: DeviceMetrics) => {
+              devicesObj[device.subject] = device
+            })
+            setMetrics(devicesObj)
+
+            // Update connected stream names list
+            if (message.connected_devices && Array.isArray(message.connected_devices)) {
+              setConnectedStreamNames(message.connected_devices)
+            }
+
+            // Update device status if present
+            if (message.device_status && Array.isArray(message.device_status)) {
+              setDeviceStatus(message.device_status)
+            }
+          } else if (message.type === "feedback_update" && message.devices) {
+            // Legacy format: { type: "feedback_update", timestamp: ..., devices: {...}, device_status: [...] }
             setMetrics(message.devices)
+
+            // Update device status if present
+            if (message.device_status && Array.isArray(message.device_status)) {
+              setDeviceStatus(message.device_status)
+            }
           } else if (Array.isArray(message)) {
             // Backend might send array of device metrics directly
             const devicesObj: Record<string, DeviceMetrics> = {}
@@ -104,5 +128,5 @@ export function useRealtimeData() {
     }
   }, [])
 
-  return { metrics, isConnected, error }
+  return { metrics, deviceStatus, connectedStreamNames, isConnected, error }
 }

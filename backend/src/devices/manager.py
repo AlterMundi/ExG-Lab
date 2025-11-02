@@ -21,9 +21,12 @@ import logging
 import time
 import re
 import os
+import shutil
+import threading
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 import asyncio
+from bleak import BleakScanner
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,7 @@ class DeviceManager:
         """
         self.connected_processes: Dict[str, subprocess.Popen] = {}
         self.device_info: Dict[str, Device] = {}
+        self.output_threads: Dict[str, threading.Thread] = {}  # Stream name -> output monitor thread
 
         # Get muselsl path
         # Try venv first (if running from venv), then fall back to system PATH
@@ -92,29 +96,10 @@ class DeviceManager:
         Raises:
             RuntimeError: If muselsl not found and hardware is required
         """
-        try:
-            # Check if muselsl is available
-            result = subprocess.run(
-                [self.muselsl_cmd, '--version'],
-                capture_output=True,
-                text=True,
-                timeout=5.0
-            )
+        # Check if muselsl executable exists
+        muselsl_path = shutil.which(self.muselsl_cmd)
 
-            if result.returncode == 0:
-                version = result.stdout.strip()
-                logger.info(f"muselsl found: {version}")
-
-                # Warn about known buggy versions
-                if '2.2.2' in version:
-                    logger.warning(
-                        "muselsl v2.2.2 has known bugs (bluetoothctl EOF handling). "
-                        "See docs/07-muselsl-bugfixes.md for workarounds."
-                    )
-            else:
-                logger.warning(f"muselsl version check failed: {result.stderr}")
-
-        except FileNotFoundError:
+        if muselsl_path is None:
             error_msg = (
                 f"muselsl not found at '{self.muselsl_cmd}'. "
                 "Install with: pip install muselsl\n"
@@ -127,59 +112,99 @@ class DeviceManager:
                 raise RuntimeError(error_msg)
             else:
                 logger.warning(f"{error_msg}\nContinuing in development mode (hardware not required)")
+            return
+
+        logger.info(f"muselsl found at: {muselsl_path}")
+
+        # Attempt version detection via pip show (non-failing)
+        try:
+            pip_result = subprocess.run(
+                ['pip', 'show', 'muselsl'],
+                capture_output=True,
+                text=True,
+                timeout=5.0
+            )
+
+            if pip_result.returncode == 0:
+                # Parse version from pip output
+                for line in pip_result.stdout.split('\n'):
+                    if line.startswith('Version:'):
+                        version = line.split(':', 1)[1].strip()
+                        logger.info(f"muselsl version: {version}")
+
+                        # Warn about known buggy versions
+                        if '2.2.2' in version:
+                            logger.warning(
+                                "muselsl v2.2.2 has known bugs (bluetoothctl EOF handling). "
+                                "See docs/07-muselsl-bugfixes.md for workarounds."
+                            )
+                        break
+            else:
+                logger.warning("Could not determine muselsl version via pip show")
 
         except Exception as e:
-            logger.warning(f"muselsl validation failed: {e}")
+            logger.warning(f"Version check failed: {e}")
 
-    def scan_devices(self, timeout: float = 5.0) -> List[Device]:
+    async def _scan_with_bleak(self, timeout: float) -> List[Device]:
         """
-        Scan for available Muse devices using muselsl list.
+        Scan for Muse devices using bleak directly (avoids subprocess issues).
 
         Args:
             timeout: Scan timeout in seconds
 
         Returns:
             List of discovered Device objects
+        """
+        logger.info(f"Scanning for Muse devices with bleak (timeout={timeout}s)...")
+
+        try:
+            # Use bleak's async scanner
+            devices_found = await BleakScanner.discover(timeout=timeout)
+            muse_devices = []
+
+            for device in devices_found:
+                # Filter for Muse devices
+                if device.name and 'muse' in device.name.lower():
+                    # Create short display name (last 4 chars of MAC)
+                    short_id = device.address.replace(':', '')[-4:]
+                    display_name = f"Muse S - {short_id}"
+
+                    muse_device = Device(
+                        name=display_name,
+                        address=device.address.upper(),
+                        status="available"
+                    )
+                    muse_devices.append(muse_device)
+                    logger.info(f"  Found: {display_name} ({device.address})")
+
+            return muse_devices
+
+        except Exception as e:
+            logger.error(f"Bleak scan error: {e}")
+            raise
+
+    async def scan_devices_async(self, timeout: float = 10.0) -> List[Device]:
+        """
+        Scan for available Muse devices using bleak directly (async version).
+
+        Args:
+            timeout: Scan timeout in seconds (default 10s for reliable BLE discovery)
+
+        Returns:
+            List of discovered Device objects
 
         Raises:
-            RuntimeError: If muselsl is not available (only if EXG_REQUIRE_HARDWARE=true)
+            RuntimeError: If scan fails and EXG_REQUIRE_HARDWARE=true
 
         Note:
-            This wraps `muselsl list` which has known bugs in v2.2.2:
-            - May fail with EOF error on some systems
-            - See docs/07-muselsl-bugfixes.md for workarounds
+            Uses bleak directly instead of muselsl subprocess to avoid async conflicts.
+            Bleak typically needs ~10 seconds for reliable BLE discovery.
         """
         logger.info(f"Scanning for Muse devices (timeout={timeout}s)...")
 
         try:
-            # Run muselsl list command
-            result = subprocess.run(
-                [self.muselsl_cmd, 'list'],
-                capture_output=True,
-                text=True,
-                timeout=timeout + 2,  # Extra buffer for process overhead
-            )
+            devices = await self._scan_with_bleak(timeout)
 
-            if result.returncode != 0:
-                error_msg = f"muselsl list failed (exit code {result.returncode}): {result.stderr}"
-                logger.error(error_msg)
-
-                # Check if it's a Bluetooth issue
-                if 'bluetooth' in result.stderr.lower() or 'hci' in result.stderr.lower():
-                    logger.error(
-                        "Bluetooth may not be enabled. Try:\n"
-                        "  sudo systemctl start bluetooth\n"
-                        "  sudo bluetoothctl power on"
-                    )
-
-                if self.require_hardware:
-                    raise RuntimeError(error_msg)
-                else:
-                    logger.warning("Returning empty device list (development mode)")
-                    return []
-
-            # Parse output
-            devices = self._parse_muselsl_list_output(result.stdout)
             logger.info(f"Found {len(devices)} Muse device(s)")
 
             if len(devices) == 0:
@@ -192,29 +217,6 @@ class DeviceManager:
 
             return devices
 
-        except subprocess.TimeoutExpired:
-            error_msg = f"Device scan timed out after {timeout}s"
-            logger.error(error_msg)
-
-            if self.require_hardware:
-                raise RuntimeError(error_msg)
-            else:
-                logger.warning("Returning empty device list (development mode)")
-                return []
-
-        except FileNotFoundError:
-            error_msg = (
-                f"muselsl command not found at '{self.muselsl_cmd}'. "
-                "This should have been caught in _validate_muselsl()"
-            )
-            logger.error(error_msg)
-
-            if self.require_hardware:
-                raise RuntimeError(error_msg)
-            else:
-                logger.warning("Returning empty device list (development mode)")
-                return []
-
         except Exception as e:
             error_msg = f"Device scan error: {e}"
             logger.error(error_msg)
@@ -224,6 +226,15 @@ class DeviceManager:
             else:
                 logger.warning("Returning empty device list (development mode)")
                 return []
+
+    def scan_devices(self, timeout: float = 10.0) -> List[Device]:
+        """
+        Synchronous wrapper for scan_devices_async.
+
+        This is provided for backward compatibility, but scan_devices_async
+        should be preferred when calling from async contexts.
+        """
+        return asyncio.run(self._scan_with_bleak(timeout))
 
     def _parse_muselsl_list_output(self, output: str) -> List[Device]:
         """
@@ -264,6 +275,33 @@ class DeviceManager:
 
         return devices
 
+    def _monitor_subprocess_output(self, stream_name: str, process: subprocess.Popen):
+        """
+        Monitor subprocess output in real-time and log it.
+
+        Runs in a background thread to capture muselsl output as it happens.
+
+        Args:
+            stream_name: Device stream name for logging
+            process: The subprocess to monitor
+        """
+        logger.info(f"Starting output monitor for {stream_name}")
+
+        try:
+            for line in iter(process.stdout.readline, ''):
+                if not line:  # EOF
+                    break
+
+                line = line.rstrip()
+                if line:
+                    # Prefix each line with device name for clarity
+                    logger.info(f"[{stream_name}] {line}")
+
+        except Exception as e:
+            logger.error(f"Error monitoring {stream_name} output: {e}")
+        finally:
+            logger.info(f"Output monitor stopped for {stream_name}")
+
     def connect_device(self, address: str, stream_name: str) -> bool:
         """
         Connect to a Muse device and start LSL streaming.
@@ -289,8 +327,15 @@ class DeviceManager:
         logger.info(f"Connecting {stream_name} to {address}...")
 
         try:
-            # Start muselsl stream subprocess
+            # Start muselsl stream subprocess with auto backend
             # Command: muselsl stream --address <MAC> --name <STREAM_NAME>
+            # Note: Omitting --backend flag to let muselsl auto-detect (avoids sudo prompt on Linux)
+
+            # Use unbuffered output for real-time logging
+            import os
+            env = os.environ.copy()
+            env['PYTHONUNBUFFERED'] = '1'
+
             process = subprocess.Popen(
                 [
                     self.muselsl_cmd, 'stream',
@@ -298,8 +343,10 @@ class DeviceManager:
                     '--name', stream_name,
                 ],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,  # Merge stderr into stdout for unified logging
                 text=True,
+                bufsize=1,  # Line buffered
+                env=env,
             )
 
             # Store process handle
@@ -314,9 +361,17 @@ class DeviceManager:
             )
 
             logger.info(f"✓ {stream_name} subprocess started (PID: {process.pid})")
+            logger.info(f"  Command: {self.muselsl_cmd} stream --address {address} --name {stream_name}")
 
-            # TODO: Wait for LSL stream to become available (optional enhancement)
-            # For now, assume ~2-5 seconds for Bluetooth connection + LSL publish
+            # Start output monitoring thread
+            monitor_thread = threading.Thread(
+                target=self._monitor_subprocess_output,
+                args=(stream_name, process),
+                name=f"muselsl-monitor-{stream_name}",
+                daemon=True
+            )
+            monitor_thread.start()
+            self.output_threads[stream_name] = monitor_thread
 
             return True
 
@@ -331,7 +386,7 @@ class DeviceManager:
         """
         Disconnect a Muse device and stop LSL streaming.
 
-        Gracefully terminates the muselsl subprocess.
+        Gracefully terminates the muselsl subprocess and cleans up Bluetooth connection.
 
         Args:
             stream_name: LSL stream name (e.g., "Muse_1")
@@ -345,6 +400,11 @@ class DeviceManager:
 
         logger.info(f"Disconnecting {stream_name}...")
 
+        # Get device MAC address for Bluetooth cleanup
+        device_address = None
+        if stream_name in self.device_info:
+            device_address = self.device_info[stream_name].address
+
         try:
             process = self.connected_processes[stream_name]
 
@@ -352,6 +412,7 @@ class DeviceManager:
             process.terminate()
 
             try:
+                # Wait for process to terminate (no need to capture output - already monitored)
                 process.wait(timeout=3.0)
                 logger.info(f"✓ {stream_name} gracefully stopped")
             except subprocess.TimeoutExpired:
@@ -361,10 +422,33 @@ class DeviceManager:
                 process.wait()
                 logger.info(f"✓ {stream_name} force killed")
 
+            # CRITICAL: Clean up Bluetooth connection at OS level
+            # This prevents the device from being locked after muselsl termination
+            if device_address:
+                try:
+                    logger.info(f"Cleaning up Bluetooth connection for {device_address}...")
+                    cleanup_result = subprocess.run(
+                        ['bluetoothctl', 'disconnect', device_address],
+                        capture_output=True,
+                        text=True,
+                        timeout=5.0
+                    )
+                    if cleanup_result.returncode == 0:
+                        logger.info(f"✓ Bluetooth disconnected: {device_address}")
+                    else:
+                        logger.warning(f"Bluetooth disconnect warning: {cleanup_result.stderr[:200]}")
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup Bluetooth connection: {e}")
+
             # Cleanup
             del self.connected_processes[stream_name]
             if stream_name in self.device_info:
                 self.device_info[stream_name].status = "disconnected"
+
+            # Cleanup output monitor thread
+            if stream_name in self.output_threads:
+                # Thread will terminate when process stdout closes
+                del self.output_threads[stream_name]
 
             return True
 
