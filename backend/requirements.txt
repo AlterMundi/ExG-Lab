@@ -3,7 +3,9 @@ uvicorn[standard]>=0.32.0
 websockets>=14.0
 python-multipart>=0.0.20
 pylsl>=1.16.2
-muselsl>=2.2.0  # Note: v2.2.2 has known bugs - see docs/07-muselsl-bugfixes.md
+# Use patched muselsl fork with EOF and filename fixes (PR #224)
+# See docs/07-muselsl-bugfixes.md for details
+git+https://github.com/Fede654/muse-lsl.git@fix/bluetoothctl-eof-and-record-filename#egg=muselsl
 numpy>=1.26.0,<2.0.0
 scipy>=1.13.0
 pandas>=2.2.0
